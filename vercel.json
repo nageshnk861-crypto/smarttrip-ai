@@ -1,0 +1,27 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "next.config.js",
+      "use": "@vercel/next"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "/app/api/$1"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/app/$1"
+    }
+  ],
+  "env": {
+    "SUPABASE_URL": "@supabase-url",
+    "SUPABASE_ANON_KEY": "@supabase-anon-key",
+    "STRIPE_SECRET_KEY": "@stripe-secret-key",
+    "OPENAI_API_KEY": "@openai-api-key",
+    "WEATHER_API_KEY": "@weather-api-key",
+    "MAPS_API_KEY": "@maps-api-key"
+  }
+}

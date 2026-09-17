@@ -1,0 +1,23 @@
+# Environment secrets
+.env
+.env.local
+.env.*.local
+
+# Firebase credentials
+serviceAccountKey.json
+service-account.json
+firebase-service-account.json
+firebase-adminsdk*.json
+
+# Next.js
+.next/
+
+# Dependencies
+node_modules/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.dbs

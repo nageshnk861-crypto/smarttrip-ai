@@ -1,0 +1,21 @@
+{
+  "name": "SmartTrip",
+  "short_name": "SmartTrip",
+  "description": "A budget-friendly travel planning application.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#4A90E2",
+  "icons": [
+    {
+      "src": "/icon-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
