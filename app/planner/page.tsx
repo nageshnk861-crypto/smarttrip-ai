@@ -1,77 +1,350 @@
 'use client';
 
-import { FormEvent, useMemo, useState } from 'react';
+import { FormEvent, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
+import { DestinationSearch, PlaceDetails } from '../../components/planner/DestinationSearch';
+import { parseTripPrompt } from '../../lib/planner/validators';
+import { ALL_INTEREST_OPTIONS } from '../../lib/config';
+import {
+  DEFAULT_BUDGET_AMOUNT,
+  DEFAULT_TRIP_DAYS,
+  DEFAULT_TRIP_TRAVELERS,
+} from '../../lib/config';
+
+type BoundingBox = [number, number, number, number];
 
 type TravelStyle = 'Budget' | 'Comfort' | 'Premium';
 
+type AgentStep = {
+  tool: string;
+  status: 'completed' | 'skipped';
+  source: string;
+  summary: string;
+};
+
 type TripPlan = {
   destination: string;
+  coordinates?: { latitude: number; longitude: number };
+  city?: string;
+  state?: string;
+  country?: string;
   totalCost: number;
   budget: number;
+  remaining: number;
+  budgetUsagePercentage: number;
+  currency: string;
   transport: number;
   accommodation: number;
   food: number;
   activities: number;
   localTransport: number;
   buffer: number;
+  dailyBudget?: Array<{
+    day: number;
+    transport: number;
+    accommodation: number;
+    food: number;
+    localTransport: number;
+    activities: number;
+    buffer: number;
+    total: number;
+  }>;
+  candidates: {
+    name: string;
+    budgetTotal: number;
+    remainingBudget: number;
+    interestScore: number;
+    feasible: boolean;
+  }[];
+  nearbyPlaces: {
+    place_id: string;
+    name: string;
+    category: string;
+    latitude: number;
+    longitude: number;
+    distance?: number;
+  }[];
+  optimization: string;
+  isDemo: boolean;
+  source: string;
   days: {
     day: number;
     title: string;
     activities: string[];
+    places?: string[];
   }[];
+  agent?: {
+    steps: AgentStep[];
+    explanation: string;
+  };
+  /** Research budget from live provider data (may be absent if research failed). */
+  researchBudget?: {
+    accommodation: { lineTotal: number; priceRange: { min: number; max: number }; isLiveData: boolean; name: string; description?: string };
+    food: { lineTotal: number; priceRange: { min: number; max: number }; isLiveData: boolean; name: string; description?: string };
+    intercityTransport: { lineTotal: number; priceRange: { min: number; max: number }; name: string; description?: string };
+    localTransport: { lineTotal: number; priceRange: { min: number; max: number }; name: string; description?: string };
+    activities: { lineTotal: number; priceRange: { min: number; max: number }; name: string };
+    buffer: { lineTotal: number };
+    total: number;
+    minimum: number;
+    maximum: number;
+    perPerson: number;
+    perDay: number;
+    perPersonPerDay: number;
+    currency: string;
+    remaining: number;
+    breakdown: string;
+  };
+  /** Full research result for transport, hotel, food, weather sections. */
+  research?: {
+    intercityTransport: {
+      options: Array<{
+        mode: string; class?: string; priceRange: { min: number; max: number; currency: string };
+        durationMinutes?: number; distanceKm?: number;
+        source: { name: string; sourceType: string };
+      }>;
+    };
+    accommodation: {
+      results: Array<{ name: string; address?: string; pricePerNight: { min: number; max: number; currency: string }; userRating?: number }>;
+      priceRange: { min: number; max: number; currency: string };
+      hasLiveData: boolean;
+    };
+    food: {
+      restaurants: Array<{ name: string; address?: string; priceLevel?: number; userRating?: number }>;
+      dailyCostPerPerson: { min: number; max: number; currency: string };
+      hasLiveData: boolean;
+    };
+    weather: {
+      available: boolean;
+      current?: { tempC: number; description: string; humidity: number; windKph: number };
+      forecast: Array<{ date: string; tempMinC: number; tempMaxC: number; description: string; rainProbability?: number }>;
+    };
+    hasAnyLiveData: boolean;
+  };
 };
 
-const interestOptions = [
-  'Nature',
-  'Food',
-  'Beaches',
-  'Mountains',
-  'History',
-  'Adventure',
-  'Photography',
-  'Shopping',
-];
+// ─── Geolocation types ───────────────────────────────────────────────────────
 
-const destinationOptions = [
-  'Goa',
-  'Coorg',
-  'Mysore',
-  'Chikmagalur',
-  'Hampi',
-  'Wayanad',
-];
+type GeoStatus =
+  | 'idle'                 // not yet attempted
+  | 'detecting'            // waiting for browser permission / GPS fix / reverse geocode
+  | 'detected'             // success — coordinates and name are set
+  | 'denied'               // PERMISSION_DENIED (1)
+  | 'position_unavailable' // POSITION_UNAVAILABLE (2)
+  | 'timeout'              // TIMEOUT (3)
+  | 'unavailable'          // browser unsupported or unexpected failure
+  | 'manual';              // user manually typed/changed the location
 
-const destinationDescriptions: Record<string, string> = {
-  Goa: 'Beaches, local food, sunsets and relaxed coastal experiences.',
-  Coorg: 'Coffee plantations, waterfalls, forests and peaceful nature.',
-  Mysore: 'Palaces, heritage sites, local food and cultural experiences.',
-  Chikmagalur: 'Mountains, coffee estates, viewpoints and nature.',
-  Hampi: 'Ancient ruins, history, landscapes and photography.',
-  Wayanad: 'Forests, waterfalls, wildlife and scenic mountain views.',
+type OriginLocation = {
+  name: string;
+  latitude?: number;
+  longitude?: number;
+  /** 'browser-geolocation' when from browser GPS, 'manual' when typed by the user */
+  source: 'browser-geolocation' | 'manual';
 };
 
-function formatCurrency(amount: number) {
+/** Calls /api/places/reverse-geocode (server-side Nominatim) */
+async function reverseGeocode(
+  lat: number,
+  lng: number,
+): Promise<{ name: string; city?: string; state?: string; country?: string } | null> {
+  try {
+    const res = await fetch(
+      `/api/places/reverse-geocode?lat=${lat}&lng=${lng}`,
+    );
+    if (!res.ok) return null;
+    return (await res.json()) as { name: string; city?: string; state?: string; country?: string };
+  } catch {
+    return null;
+  }
+}
+
+// ─── Planner page ─────────────────────────────────────────────────────────────
+
+function formatCurrency(amount: number, currency = 'INR') {
   return new Intl.NumberFormat('en-IN', {
     style: 'currency',
-    currency: 'INR',
+    currency,
     maximumFractionDigits: 0,
   }).format(amount);
 }
 
-export default function PlannerPage() {
-  const [startingLocation, setStartingLocation] = useState('Bangalore');
-  const [destination, setDestination] = useState('');
-  const [budget, setBudget] = useState('15000');
-  const [days, setDays] = useState('3');
-  const [travelers, setTravelers] = useState('2');
-  const [interests, setInterests] = useState<string[]>([
-    'Nature',
-    'Food',
-  ]);
-  const [travelStyle, setTravelStyle] =
-    useState<TravelStyle>('Budget');
+function PlannerPageContent() {
+  const searchParams = useSearchParams();
+  const parsedPrompt = parseTripPrompt(searchParams.get('prompt') ?? '');
+  const initialInterests = Array.isArray(parsedPrompt.interests)
+    ? parsedPrompt.interests
+    : ['Nature', 'Food'];
 
+  const [destination, setDestination] = useState(
+    typeof parsedPrompt.destination === 'string' ? parsedPrompt.destination : '',
+  );
+
+  // ── Starting location with geolocation ──────────────────────────────────
+  // If the prompt already has an origin, use it and skip geolocation.
+  const promptHasOrigin = typeof parsedPrompt.origin === 'string' && parsedPrompt.origin.trim() !== '';
+
+  const [origin, setOrigin] = useState<OriginLocation>({
+    name: promptHasOrigin ? (parsedPrompt.origin as string).trim() : '',
+    source: promptHasOrigin ? 'manual' : 'browser-geolocation',
+  });
+  const [geoStatus, setGeoStatus] = useState<GeoStatus>(
+    promptHasOrigin ? 'manual' : 'idle',
+  );
+  // Prevent running geolocation more than once automatically
+  const geoAttempted = useRef(false);
+
+  const detectLocation = useCallback(async () => {
+    if (typeof window === 'undefined' || !navigator?.geolocation) {
+      if (process.env.NODE_ENV === 'development') {
+        console.warn('[Geolocation] navigator.geolocation is not supported in this environment.');
+      }
+      setGeoStatus('unavailable');
+      return;
+    }
+
+    setGeoStatus('detecting');
+
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        try {
+          const { latitude, longitude } = pos.coords;
+          const result = await reverseGeocode(latitude, longitude);
+          if (result && result.name) {
+            setOrigin({
+              name: result.name,
+              latitude,
+              longitude,
+              source: 'browser-geolocation',
+            });
+            setGeoStatus('detected');
+          } else {
+            if (process.env.NODE_ENV === 'development') {
+              console.warn(
+                '[Geolocation] Reverse geocoding returned no address for coords:',
+                latitude,
+                longitude,
+              );
+            }
+            setGeoStatus('position_unavailable');
+          }
+        } catch (err) {
+          if (process.env.NODE_ENV === 'development') {
+            console.warn('[Geolocation] Reverse geocode request failed:', err);
+          }
+          setGeoStatus('position_unavailable');
+        }
+      },
+      (err: GeolocationPositionError) => {
+        if (process.env.NODE_ENV === 'development') {
+          console.warn('[Geolocation Error]', {
+            code: err.code,
+            message: err.message,
+          });
+        }
+
+        switch (err.code) {
+          case 1: // err.PERMISSION_DENIED
+            setGeoStatus('denied');
+            break;
+          case 2: // err.POSITION_UNAVAILABLE
+            setGeoStatus('position_unavailable');
+            break;
+          case 3: // err.TIMEOUT
+            setGeoStatus('timeout');
+            break;
+          default:
+            setGeoStatus('unavailable');
+            break;
+        }
+      },
+      {
+        enableHighAccuracy: true,
+        timeout: 15000,
+        maximumAge: 300000,
+      },
+    );
+  }, []);
+
+  // Auto-detect on first render only (not on every re-render)
+  useEffect(() => {
+    if (geoAttempted.current || promptHasOrigin) return;
+    geoAttempted.current = true;
+    void detectLocation();
+  }, [detectLocation, promptHasOrigin]);
+
+  // Convenience: the plain text the form uses
+  const startingLocation = origin.name;
+  const setStartingLocation = (name: string) => {
+    setOrigin({ name, latitude: undefined, longitude: undefined, source: 'manual' });
+    setGeoStatus('manual');
+  };
+
+  // Geo status label shown below the input
+  const geoLabel: { icon: string; text: string; color: string } | null = useMemo(() => {
+    switch (geoStatus) {
+      case 'detecting':
+        return {
+          icon: '⏳',
+          text: 'Detecting your current location...',
+          color: '#2563eb',
+        };
+      case 'detected':
+        return {
+          icon: '✓',
+          text: 'Current location detected',
+          color: '#16a34a',
+        };
+      case 'denied':
+        return {
+          icon: '⚠️',
+          text: 'Location permission was denied. Please allow location access for localhost and try again.',
+          color: '#dc2626',
+        };
+      case 'position_unavailable':
+        return {
+          icon: '⚠️',
+          text: 'Your current location could not be determined. Please try again.',
+          color: '#f59e0b',
+        };
+      case 'timeout':
+        return {
+          icon: '⚠️',
+          text: 'Location detection timed out. Please try again.',
+          color: '#f59e0b',
+        };
+      case 'unavailable':
+        return {
+          icon: '⚠️',
+          text: 'Unable to detect location. Please enter your starting location manually.',
+          color: '#f59e0b',
+        };
+      default:
+        return null;
+    }
+  }, [geoStatus]);
+  // ── End geolocation ──────────────────────────────────────────────────────
+  const [selectedPlace, setSelectedPlace] = useState<PlaceDetails | null>(null);
+  const [budget, setBudget] = useState(
+    typeof parsedPrompt.budget === 'number'
+      ? String(parsedPrompt.budget)
+      : String(DEFAULT_BUDGET_AMOUNT),
+  );
+  const [days, setDays] = useState(
+    typeof parsedPrompt.days === 'number'
+      ? String(parsedPrompt.days)
+      : String(DEFAULT_TRIP_DAYS),
+  );
+  const [travelers, setTravelers] = useState(
+    typeof parsedPrompt.travelers === 'number'
+      ? String(parsedPrompt.travelers)
+      : String(DEFAULT_TRIP_TRAVELERS),
+  );
+  const [interests, setInterests] = useState<string[]>(initialInterests);
+  const [travelStyle, setTravelStyle] = useState<TravelStyle>('Budget');
   const [isPlanning, setIsPlanning] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveMessage, setSaveMessage] = useState('');
   const [tripPlan, setTripPlan] = useState<TripPlan | null>(null);
   const [error, setError] = useState('');
 
@@ -79,235 +352,21 @@ export default function PlannerPage() {
   const numericDays = Number(days) || 0;
   const numericTravelers = Number(travelers) || 0;
 
-  const budgetPerTraveler = useMemo(() => {
-    if (!numericTravelers) return 0;
-
-    return Math.round(numericBudget / numericTravelers);
-  }, [numericBudget, numericTravelers]);
+  const budgetPerTraveler = useMemo(
+    () => (numericTravelers ? Math.round(numericBudget / numericTravelers) : 0),
+    [numericBudget, numericTravelers],
+  );
 
   function toggleInterest(interest: string) {
-    setInterests((current) => {
-      if (current.includes(interest)) {
-        return current.filter((item) => item !== interest);
-      }
-
-      return [...current, interest];
-    });
-  }
-
-  function chooseDestination() {
-    if (destination) {
-      return destination;
-    }
-
-    if (interests.includes('Beaches')) {
-      return 'Goa';
-    }
-
-    if (interests.includes('Mountains')) {
-      return 'Chikmagalur';
-    }
-
-    if (interests.includes('History')) {
-      return 'Hampi';
-    }
-
-    if (interests.includes('Nature')) {
-      return 'Coorg';
-    }
-
-    return 'Mysore';
-  }
-
-  function calculatePlan(selectedDestination: string): TripPlan {
-    const styleMultiplier: Record<TravelStyle, number> = {
-      Budget: 1,
-      Comfort: 1.35,
-      Premium: 1.8,
-    };
-
-    const multiplier = styleMultiplier[travelStyle];
-
-    const baseTransport = 1800;
-    const baseAccommodationPerDay = 1200;
-    const baseFoodPerDay = 700;
-    const baseActivitiesPerDay = 500;
-    const baseLocalTransportPerDay = 300;
-
-    const transport = Math.round(
-      baseTransport * multiplier * Math.max(1, numericTravelers / 2)
+    setInterests((current) =>
+      current.includes(interest)
+        ? current.filter((i) => i !== interest)
+        : [...current, interest],
     );
-
-    const accommodation = Math.round(
-      baseAccommodationPerDay *
-        numericDays *
-        multiplier *
-        Math.max(1, numericTravelers / 2)
-    );
-
-    const food = Math.round(
-      baseFoodPerDay *
-        numericDays *
-        numericTravelers *
-        multiplier
-    );
-
-    const activities = Math.round(
-      baseActivitiesPerDay *
-        numericDays *
-        numericTravelers *
-        multiplier
-    );
-
-    const localTransport = Math.round(
-      baseLocalTransportPerDay *
-        numericDays *
-        numericTravelers *
-        multiplier
-    );
-
-    const subtotal =
-      transport +
-      accommodation +
-      food +
-      activities +
-      localTransport;
-
-    const buffer = Math.round(subtotal * 0.08);
-
-    const totalCost = subtotal + buffer;
-
-    const dayPlans = createDayPlans(selectedDestination);
-
-    return {
-      destination: selectedDestination,
-      totalCost,
-      budget: numericBudget,
-      transport,
-      accommodation,
-      food,
-      activities,
-      localTransport,
-      buffer,
-      days: dayPlans,
-    };
-  }
-
-  function createDayPlans(selectedDestination: string) {
-    const plans: TripPlan['days'] = [];
-
-    for (let day = 1; day <= numericDays; day++) {
-      let title = '';
-      let activitiesForDay: string[] = [];
-
-      if (day === 1) {
-        title = `Arrival and explore ${selectedDestination}`;
-
-        activitiesForDay = [
-          `Travel from ${startingLocation} to ${selectedDestination}`,
-          'Check in to accommodation',
-        ];
-
-        if (interests.includes('Food')) {
-          activitiesForDay.push(
-            'Explore a popular local food area'
-          );
-        }
-
-        if (interests.includes('Nature')) {
-          activitiesForDay.push(
-            'Visit a nearby scenic nature spot'
-          );
-        }
-
-        if (interests.includes('Beaches')) {
-          activitiesForDay.push(
-            'Relax at a nearby beach and watch the sunset'
-          );
-        }
-      } else if (day === numericDays) {
-        title = 'Final experiences and return';
-
-        if (interests.includes('Shopping')) {
-          activitiesForDay.push(
-            'Visit a local market for shopping'
-          );
-        }
-
-        if (interests.includes('Food')) {
-          activitiesForDay.push(
-            'Have a final local breakfast or lunch'
-          );
-        }
-
-        activitiesForDay.push(
-          `Return from ${selectedDestination} to ${startingLocation}`
-        );
-      } else {
-        title = `Explore ${selectedDestination}`;
-
-        if (interests.includes('Nature')) {
-          activitiesForDay.push(
-            'Visit a scenic nature attraction'
-          );
-        }
-
-        if (interests.includes('Mountains')) {
-          activitiesForDay.push(
-            'Explore mountain viewpoints and landscapes'
-          );
-        }
-
-        if (interests.includes('History')) {
-          activitiesForDay.push(
-            'Explore a historical or cultural attraction'
-          );
-        }
-
-        if (interests.includes('Adventure')) {
-          activitiesForDay.push(
-            'Try a suitable outdoor adventure activity'
-          );
-        }
-
-        if (interests.includes('Photography')) {
-          activitiesForDay.push(
-            'Visit a scenic photography location'
-          );
-        }
-
-        if (interests.includes('Beaches')) {
-          activitiesForDay.push(
-            'Spend time at a coastal location'
-          );
-        }
-
-        if (interests.includes('Food')) {
-          activitiesForDay.push(
-            'Try recommended local cuisine'
-          );
-        }
-
-        if (activitiesForDay.length === 0) {
-          activitiesForDay.push(
-            'Explore the destination and discover local attractions'
-          );
-        }
-      }
-
-      plans.push({
-        day,
-        title,
-        activities: activitiesForDay,
-      });
-    }
-
-    return plans;
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-
     setError('');
     setTripPlan(null);
 
@@ -315,156 +374,269 @@ export default function PlannerPage() {
       setError('Please enter your starting location.');
       return;
     }
-
+    if (!selectedPlace) {
+      setError('Please search and select a destination from the results.');
+      return;
+    }
+    if (
+      selectedPlace.latitude === undefined ||
+      selectedPlace.longitude === undefined ||
+      !Number.isFinite(selectedPlace.latitude) ||
+      !Number.isFinite(selectedPlace.longitude)
+    ) {
+      setError(
+        'The selected destination is missing coordinates. Please select it again from the search results.',
+      );
+      return;
+    }
     if (numericBudget < 1000) {
       setError('Please enter a budget of at least ₹1,000.');
       return;
     }
-
     if (numericDays < 1 || numericDays > 30) {
       setError('Trip duration must be between 1 and 30 days.');
       return;
     }
-
     if (numericTravelers < 1 || numericTravelers > 20) {
       setError('Travelers must be between 1 and 20.');
       return;
     }
-
     if (interests.length === 0) {
       setError('Please select at least one interest.');
       return;
     }
 
     setIsPlanning(true);
+    try {
+      const response = await fetch('/api/plan-trip', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          origin: startingLocation.trim(),
+          originLatitude: origin.source === 'browser-geolocation' ? origin.latitude : undefined,
+          originLongitude: origin.source === 'browser-geolocation' ? origin.longitude : undefined,
+          destination: destination || selectedPlace.name || selectedPlace.description,
+          latitude: selectedPlace.latitude,
+          longitude: selectedPlace.longitude,
+          boundingBox: selectedPlace.boundingBox ?? undefined,
+          osmType: selectedPlace.osmType ?? undefined,
+          city: selectedPlace.city,
+          state: selectedPlace.state,
+          country: selectedPlace.country,
+          budget: numericBudget,
+          days: numericDays,
+          travelers: numericTravelers,
+          interests,
+          travelStyle,
+        }),
+      });
 
-    // Simulate planning work.
-    await new Promise((resolve) => setTimeout(resolve, 1200));
+      const result = await response.json();
 
-    const selectedDestination = chooseDestination();
-    const plan = calculatePlan(selectedDestination);
+      if (!response.ok) {
+        const adjustments =
+          Array.isArray(result.adjustments) && result.adjustments.length
+            ? ` Suggestions: ${(result.adjustments as string[]).join(', ')}.`
+            : '';
+        setError(`${result.error ?? 'Unable to create a trip plan.'}${adjustments}`);
+        return;
+      }
 
-    setIsPlanning(false);
-
-    if (plan.totalCost > numericBudget) {
-      setError(
-        `No feasible ${travelStyle.toLowerCase()} plan was generated within your current budget. Try increasing the budget, reducing the trip duration, or choosing Budget travel style.`
-      );
-      return;
+      setTripPlan(result.data as TripPlan);
+    } catch {
+      setError('Something went wrong while creating your itinerary. Please try again.');
+    } finally {
+      setIsPlanning(false);
     }
-
-    setTripPlan(plan);
   }
 
   function resetPlan() {
     setTripPlan(null);
     setError('');
+    setSaveMessage('');
   }
+
+  async function saveTrip() {
+    if (!tripPlan) return;
+    setIsSaving(true);
+    setSaveMessage('');
+    try {
+      const response = await fetch('/api/trips', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          origin: startingLocation,
+          originLatitude: origin.source === 'browser-geolocation' ? origin.latitude : undefined,
+          originLongitude: origin.source === 'browser-geolocation' ? origin.longitude : undefined,
+          destination: tripPlan.destination,
+          latitude: selectedPlace?.latitude,
+          longitude: selectedPlace?.longitude,
+          boundingBox: selectedPlace?.boundingBox ?? undefined,
+          osmType: selectedPlace?.osmType ?? undefined,
+          city: selectedPlace?.city,
+          state: selectedPlace?.state,
+          country: selectedPlace?.country,
+          budget: numericBudget,
+          days: numericDays,
+          travelers: numericTravelers,
+          interests,
+          travelStyle,
+        }),
+      });
+      const result = await response.json();
+      setSaveMessage(
+        response.ok ? '✓ Trip saved to your account.' : result.error ?? 'Unable to save this trip.',
+      );
+    } catch {
+      setSaveMessage('Unable to save this trip right now.');
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  const fmt = (n: number) => formatCurrency(n, tripPlan?.currency ?? 'INR');
 
   return (
     <div className="planner-page">
       <div className="container">
-        {/* HERO */}
+
+        {/* ── HERO ──────────────────────────────────────────────────────── */}
         <section className="planner-hero">
           <div>
-            <div className="planner-badge">
-              ✨ AI-POWERED TRIP PLANNER
-            </div>
-
+            <div className="planner-badge">✨ AI-POWERED TRIP PLANNER</div>
             <h1 className="page-title">
               Plan your perfect trip
               <br />
-              <span className="planner-highlight">
-                within your budget.
-              </span>
+              <span className="planner-highlight">within your budget.</span>
             </h1>
-
             <p className="page-subtitle">
-              Tell SmartTrip where you are starting, how much you
-              want to spend, and what you love. We&apos;ll create a
-              personalized trip plan.
+              Search a destination, set your budget and interests, and SmartTrip
+              will generate a fully dynamic, budget-aware itinerary — no
+              hardcoded suggestions.
             </p>
           </div>
         </section>
 
-        {/* PLANNER FORM */}
+        {/* ── FORM + SIDEBAR ────────────────────────────────────────────── */}
         <section className="planner-layout">
           <div className="card planner-form-card">
             <div className="section-heading">
               <span className="section-icon">🧭</span>
-
               <div>
                 <h2>Trip details</h2>
-                <p>
-                  Give us the information needed to plan your trip.
-                </p>
+                <p>All destinations are resolved dynamically from real geocoding data.</p>
               </div>
             </div>
 
             <form onSubmit={handleSubmit}>
-              {/* STARTING LOCATION */}
+
+              {/* Starting location with geolocation */}
               <div className="form-group">
                 <label className="form-label" htmlFor="startingLocation">
                   Starting location
                 </label>
+                <div style={{ position: 'relative' }}>
+                  <input
+                    id="startingLocation"
+                    type="text"
+                    className="form-input"
+                    placeholder={
+                      geoStatus === 'detecting'
+                        ? 'Detecting current location...'
+                        : 'Enter your city or town'
+                    }
+                    value={startingLocation}
+                    onChange={(e) => setStartingLocation(e.target.value)}
+                    aria-describedby="origin-status"
+                    disabled={geoStatus === 'detecting'}
+                  />
+                </div>
 
-                <input
-                  id="startingLocation"
-                  type="text"
-                  className="form-input"
-                  placeholder="e.g. Bangalore"
-                  value={startingLocation}
-                  onChange={(event) =>
-                    setStartingLocation(event.target.value)
-                  }
-                />
+                {/* Status line */}
+                {geoLabel && (
+                  <span
+                    id="origin-status"
+                    className="input-help"
+                    style={{ color: geoLabel.color, display: 'flex', alignItems: 'center', gap: '0.35rem' }}
+                  >
+                    <span aria-hidden>{geoLabel.icon}</span>
+                    {geoLabel.text}
+                  </span>
+                )}
+                {!geoLabel && (
+                  <span className="input-help">Where will your journey start?</span>
+                )}
 
-                <span className="input-help">
-                  Where will your journey start?
-                </span>
+                {/* "Use my current location" button */}
+                <button
+                  type="button"
+                  id="use-current-location-btn"
+                  onClick={() => void detectLocation()}
+                  disabled={geoStatus === 'detecting'}
+                  style={{
+                    marginTop: '0.5rem',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.35rem',
+                    fontSize: '0.85rem',
+                    fontWeight: 600,
+                    color: geoStatus === 'detecting' ? '#94a3b8' : '#2563eb',
+                    background: 'none',
+                    border: 'none',
+                    padding: 0,
+                    cursor: geoStatus === 'detecting' ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  <span aria-hidden>📍</span>
+                  {geoStatus === 'detecting' ? 'Detecting current location...' : 'Use my current location'}
+                </button>
               </div>
 
-              {/* DESTINATION */}
+              {/* Destination */}
               <div className="form-group">
                 <label className="form-label" htmlFor="destination">
                   Destination
                 </label>
-
-                <select
-                  id="destination"
-                  className="form-select"
-                  value={destination}
-                  onChange={(event) =>
-                    setDestination(event.target.value)
-                  }
-                >
-                  <option value="">
-                    ✨ Let SmartTrip choose
-                  </option>
-
-                  {destinationOptions.map((item) => (
-                    <option key={item} value={item}>
-                      {item}
-                    </option>
-                  ))}
-                </select>
-
-                <span className="input-help">
-                  Leave this on &quot;Let SmartTrip choose&quot; to get
-                  an automatic recommendation.
-                </span>
+                <DestinationSearch
+                  value={selectedPlace?.displayName ?? destination}
+                  onPlaceSelect={(place) => {
+                    setSelectedPlace(place);
+                    if (place) {
+                      setDestination(
+                        place.name ??
+                          place.formatted_address ??
+                          place.displayName ??
+                          place.description ??
+                          '',
+                      );
+                    } else {
+                      setDestination('');
+                    }
+                  }}
+                  placeholder="Search for a city, region, or landmark…"
+                />
+                {/* Coordinate confirmation badge */}
+                {selectedPlace?.latitude !== undefined && (
+                  <span className="input-help" style={{ color: '#16a34a' }}>
+                    ✓ {selectedPlace.displayName ?? selectedPlace.description} —{' '}
+                    {selectedPlace.latitude.toFixed(4)},{selectedPlace.longitude?.toFixed(4)}
+                  </span>
+                )}
+                {!selectedPlace && (
+                  <span className="input-help">
+                    Type to search — select a result to lock the destination coordinates.
+                  </span>
+                )}
               </div>
 
-              {/* BUDGET + DAYS */}
+              {/* Budget + Days */}
               <div className="form-row">
                 <div className="form-group">
                   <label className="form-label" htmlFor="budget">
                     Total budget
                   </label>
-
                   <div className="input-with-prefix">
                     <span>₹</span>
-
                     <input
                       id="budget"
                       type="number"
@@ -472,22 +644,16 @@ export default function PlannerPage() {
                       step="500"
                       className="form-input"
                       value={budget}
-                      onChange={(event) =>
-                        setBudget(event.target.value)
-                      }
+                      onChange={(e) => setBudget(e.target.value)}
                     />
                   </div>
-
-                  <span className="input-help">
-                    Total amount for all travelers.
-                  </span>
+                  <span className="input-help">Total for all travelers.</span>
                 </div>
 
                 <div className="form-group">
                   <label className="form-label" htmlFor="days">
                     Duration
                   </label>
-
                   <div className="input-with-suffix">
                     <input
                       id="days"
@@ -496,22 +662,18 @@ export default function PlannerPage() {
                       max="30"
                       className="form-input"
                       value={days}
-                      onChange={(event) =>
-                        setDays(event.target.value)
-                      }
+                      onChange={(e) => setDays(e.target.value)}
                     />
-
                     <span>days</span>
                   </div>
                 </div>
               </div>
 
-              {/* TRAVELERS */}
+              {/* Travelers */}
               <div className="form-group">
                 <label className="form-label" htmlFor="travelers">
                   Travelers
                 </label>
-
                 <input
                   id="travelers"
                   type="number"
@@ -519,39 +681,26 @@ export default function PlannerPage() {
                   max="20"
                   className="form-input"
                   value={travelers}
-                  onChange={(event) =>
-                    setTravelers(event.target.value)
-                  }
+                  onChange={(e) => setTravelers(e.target.value)}
                 />
-
-                <span className="input-help">
-                  Number of people traveling together.
-                </span>
+                <span className="input-help">Number of people traveling together.</span>
               </div>
 
-              {/* INTERESTS */}
+              {/* Interests — sourced from config, never hardcoded */}
               <div className="form-group">
-                <label className="form-label">
-                  What are you interested in?
-                </label>
-
+                <label className="form-label">What are you interested in?</label>
                 <div className="interest-grid">
-                  {interestOptions.map((interest) => {
+                  {ALL_INTEREST_OPTIONS.map((interest) => {
                     const selected = interests.includes(interest);
-
                     return (
                       <button
                         key={interest}
                         type="button"
-                        className={`interest-chip ${
-                          selected ? 'selected' : ''
-                        }`}
+                        className={`interest-chip ${selected ? 'selected' : ''}`}
                         onClick={() => toggleInterest(interest)}
+                        aria-pressed={selected}
                       >
-                        <span>
-                          {selected ? '✓' : '+'}
-                        </span>
-
+                        <span aria-hidden>{selected ? '✓' : '+'}</span>
                         {interest}
                       </button>
                     );
@@ -559,61 +708,47 @@ export default function PlannerPage() {
                 </div>
               </div>
 
-              {/* TRAVEL STYLE */}
+              {/* Travel style */}
               <div className="form-group">
-                <label className="form-label">
-                  Travel style
-                </label>
-
+                <label className="form-label">Travel style</label>
                 <div className="travel-style-grid">
-                  {(['Budget', 'Comfort', 'Premium'] as TravelStyle[]).map(
-                    (style) => (
-                      <button
-                        key={style}
-                        type="button"
-                        className={`style-option ${
-                          travelStyle === style ? 'selected' : ''
-                        }`}
-                        onClick={() => setTravelStyle(style)}
-                      >
-                        <strong>
-                          {style === 'Budget' && '💰'}
-                          {style === 'Comfort' && '🏨'}
-                          {style === 'Premium' && '✨'} {style}
-                        </strong>
-
-                        <span>
-                          {style === 'Budget' &&
-                            'Save more and travel smart'}
-                          {style === 'Comfort' &&
-                            'Balanced comfort and cost'}
-                          {style === 'Premium' &&
-                            'Higher comfort and experiences'}
-                        </span>
-                      </button>
-                    )
-                  )}
+                  {(['Budget', 'Comfort', 'Premium'] as TravelStyle[]).map((style) => (
+                    <button
+                      key={style}
+                      type="button"
+                      className={`style-option ${travelStyle === style ? 'selected' : ''}`}
+                      onClick={() => setTravelStyle(style)}
+                      aria-pressed={travelStyle === style}
+                    >
+                      <strong>
+                        {style === 'Budget' && '💰'}
+                        {style === 'Comfort' && '🏨'}
+                        {style === 'Premium' && '✨'} {style}
+                      </strong>
+                      <span>
+                        {style === 'Budget' && 'Save more and travel smart'}
+                        {style === 'Comfort' && 'Balanced comfort and cost'}
+                        {style === 'Premium' && 'Higher comfort and experiences'}
+                      </span>
+                    </button>
+                  ))}
                 </div>
               </div>
 
-              {/* ERROR */}
+              {/* Error */}
               {error && (
-                <div className="planner-error">
-                  <span>⚠️</span>
+                <div className="planner-error" role="alert">
+                  <span aria-hidden>⚠️</span>
                   <p>{error}</p>
                 </div>
               )}
 
-              {/* SUBMIT */}
-              <button
-                type="submit"
-                className="planner-submit"
-                disabled={isPlanning}
-              >
+              {/* Submit */}
+              <button type="submit" className="planner-submit" disabled={isPlanning}>
                 {isPlanning ? (
                   <>
-                    <span className="spinner" />
-                    Planning your trip...
+                    <span className="spinner" aria-hidden />
+                    Planning your trip…
                   </>
                 ) : (
                   <>✨ Plan My Trip</>
@@ -622,29 +757,49 @@ export default function PlannerPage() {
             </form>
           </div>
 
-          {/* SIDE SUMMARY */}
+          {/* Sidebar */}
           <aside className="planner-sidebar">
             <div className="card planning-summary">
               <div className="section-heading">
                 <span className="section-icon">💡</span>
-
                 <div>
                   <h2>SmartTrip will consider</h2>
-                  <p>
-                    Your plan is built around your requirements.
-                  </p>
+                  <p>Your plan is built around your requirements.</p>
                 </div>
               </div>
-
               <div className="consider-list">
                 <div>
                   <span>📍</span>
                   <p>
                     <strong>Starting point</strong>
-                    {startingLocation || 'Not specified'}
+                    {startingLocation || (
+                      <em style={{ color: '#94a3b8', fontStyle: 'normal' }}>
+                        {geoStatus === 'detecting' ? 'Detecting…' : 'Not specified'}
+                      </em>
+                    )}
+                    {origin.latitude && geoStatus === 'detected' && (
+                      <em style={{ display: 'block', fontSize: '0.75rem', color: '#16a34a' }}>
+                        📍 GPS detected
+                      </em>
+                    )}
                   </p>
                 </div>
-
+                <div>
+                  <span>🗺️</span>
+                  <p>
+                    <strong>Destination</strong>
+                    {selectedPlace
+                      ? (selectedPlace.displayName ?? selectedPlace.description)
+                      : destination || 'Not selected'}
+                    {selectedPlace?.latitude !== undefined && (
+                      <em style={{ display: 'block', fontSize: '0.75rem', color: '#64748b' }}>
+                        {selectedPlace.latitude.toFixed(4)},{' '}
+                        {selectedPlace.longitude?.toFixed(4)}
+                        {selectedPlace.boundingBox && ' · region'}
+                      </em>
+                    )}
+                  </p>
+                </div>
                 <div>
                   <span>💰</span>
                   <p>
@@ -652,7 +807,6 @@ export default function PlannerPage() {
                     {formatCurrency(numericBudget)}
                   </p>
                 </div>
-
                 <div>
                   <span>📅</span>
                   <p>
@@ -660,7 +814,6 @@ export default function PlannerPage() {
                     {numericDays || 0} days
                   </p>
                 </div>
-
                 <div>
                   <span>👥</span>
                   <p>
@@ -668,181 +821,199 @@ export default function PlannerPage() {
                     {numericTravelers || 0} people
                   </p>
                 </div>
-
                 <div>
                   <span>❤️</span>
                   <p>
                     <strong>Interests</strong>
-                    {interests.length
-                      ? interests.join(', ')
-                      : 'None selected'}
+                    {interests.length ? interests.join(', ') : 'None selected'}
                   </p>
                 </div>
               </div>
-
               <div className="budget-per-person">
                 <span>Budget per traveler</span>
-                <strong>
-                  {formatCurrency(budgetPerTraveler)}
-                </strong>
+                <strong>{formatCurrency(budgetPerTraveler)}</strong>
               </div>
             </div>
 
             <div className="card ai-info-card">
-              <div className="ai-icon">✨</div>
-
-              <h3>AI planning is coming next</h3>
-
+              <div className="ai-icon">🌐</div>
+              <h3>100% dynamic destinations</h3>
               <p>
-                This first version validates your trip requirements
-                and creates a local plan. Later, SmartTrip will use
-                real travel data and AI to improve destination,
-                route, weather, hotel and activity recommendations.
+                Destinations are geocoded in real-time via OpenStreetMap/Nominatim.
+                Nearby places are fetched from Overpass API using the selected
+                coordinates. No hardcoded city suggestions are used.
               </p>
             </div>
           </aside>
         </section>
 
-        {/* GENERATED TRIP */}
+        {/* ── TRIP RESULT ───────────────────────────────────────────────── */}
         {tripPlan && (
           <section className="trip-result">
+            {/* Header */}
             <div className="result-header">
               <div>
-                <div className="planner-badge">
-                  ✨ TRIP READY
-                </div>
-
+                <div className="planner-badge">✨ TRIP READY</div>
                 <h2>
                   {startingLocation} → {tripPlan.destination}
                 </h2>
-
                 <p>
-                  {numericDays} days · {numericTravelers} travelers ·{' '}
-                  {travelStyle} travel
+                  {numericDays} days · {numericTravelers} traveler
+                  {numericTravelers !== 1 ? 's' : ''} · {travelStyle} travel
+                  {tripPlan.city || tripPlan.state || tripPlan.country
+                    ? ` · ${[tripPlan.city, tripPlan.state, tripPlan.country].filter(Boolean).join(', ')}`
+                    : ''}
+                </p>
+                {tripPlan.coordinates && (
+                  <p style={{ fontSize: '0.8rem', color: '#64748b', marginTop: '0.25rem' }}>
+                    Coordinates: {tripPlan.coordinates.latitude.toFixed(5)},{' '}
+                    {tripPlan.coordinates.longitude.toFixed(5)}
+                  </p>
+                )}
+              </div>
+              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                <button type="button" className="secondary-button" onClick={resetPlan}>
+                  Plan Again
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={saveTrip}
+                  disabled={isSaving}
+                >
+                  {isSaving ? 'Saving…' : 'Save Trip'}
+                </button>
+              </div>
+            </div>
+
+            {saveMessage && (
+              <p
+                className="input-help"
+                style={{ color: saveMessage.startsWith('✓') ? '#16a34a' : '#dc2626' }}
+              >
+                {saveMessage}
+              </p>
+            )}
+
+            {/* ── AI Explanation ──────────────────────────────────────── */}
+            {tripPlan.agent?.explanation && (
+              <div className="card" style={{ marginBottom: '1.5rem', padding: '1.25rem' }}>
+                <div className="result-section-heading" style={{ marginBottom: '0.75rem' }}>
+                  <h3>✨ SmartTrip AI Recommendation</h3>
+                  <p>Generated from dynamically discovered places near {tripPlan.destination}.</p>
+                </div>
+                <p style={{ lineHeight: '1.7', color: '#374151' }}>
+                  {tripPlan.agent.explanation}
                 </p>
               </div>
+            )}
 
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={resetPlan}
-              >
-                Plan Again
-              </button>
-            </div>
-
-            {/* TOTAL COST */}
+            {/* ── Budget Summary ──────────────────────────────────────── */}
             <div className="result-total card">
               <div>
-                <span className="result-label">
-                  Estimated trip cost
-                </span>
-
-                <strong className="result-price">
-                  {formatCurrency(tripPlan.totalCost)}
-                </strong>
+                <span className="result-label">Estimated trip cost</span>
+                <strong className="result-price">{fmt(tripPlan.totalCost)}</strong>
               </div>
-
               <div className="budget-status">
                 <span>Budget</span>
-
-                <strong>
-                  {formatCurrency(tripPlan.budget)}
-                </strong>
-
-                <span className="remaining">
-                  {formatCurrency(
-                    tripPlan.budget - tripPlan.totalCost
-                  )}{' '}
-                  remaining
+                <strong>{fmt(tripPlan.budget)}</strong>
+                <span
+                  className="remaining"
+                  style={{ color: tripPlan.remaining >= 0 ? '#16a34a' : '#dc2626' }}
+                >
+                  {fmt(Math.abs(tripPlan.remaining))}{' '}
+                  {tripPlan.remaining >= 0 ? 'remaining' : 'over budget'}
                 </span>
+                <small>{tripPlan.budgetUsagePercentage}% of budget used</small>
               </div>
             </div>
 
-            {/* BUDGET BREAKDOWN */}
+            {/* ── Budget Breakdown ────────────────────────────────────── */}
             <div className="result-section">
               <div className="result-section-heading">
                 <h3>Budget breakdown</h3>
-
-                <p>
-                  Your estimated spending across the main trip
-                  categories.
-                </p>
+                <p>Deterministic estimates — the AI cannot change these numbers.</p>
               </div>
-
               <div className="budget-grid">
-                <BudgetItem
-                  icon="🚌"
-                  label="Transport"
-                  value={tripPlan.transport}
-                />
-
-                <BudgetItem
-                  icon="🏨"
-                  label="Accommodation"
-                  value={tripPlan.accommodation}
-                />
-
-                <BudgetItem
-                  icon="🍛"
-                  label="Food"
-                  value={tripPlan.food}
-                />
-
-                <BudgetItem
-                  icon="🎟️"
-                  label="Activities"
-                  value={tripPlan.activities}
-                />
-
-                <BudgetItem
-                  icon="🚕"
-                  label="Local transport"
-                  value={tripPlan.localTransport}
-                />
-
-                <BudgetItem
-                  icon="🛟"
-                  label="Safety buffer"
-                  value={tripPlan.buffer}
-                />
+                <BudgetItem icon="🚌" label="Transport" value={tripPlan.transport} currency={tripPlan.currency} />
+                <BudgetItem icon="🏨" label="Accommodation" value={tripPlan.accommodation} currency={tripPlan.currency} />
+                <BudgetItem icon="🍛" label="Food" value={tripPlan.food} currency={tripPlan.currency} />
+                <BudgetItem icon="🎟️" label="Activities" value={tripPlan.activities} currency={tripPlan.currency} />
+                <BudgetItem icon="🚕" label="Local transport" value={tripPlan.localTransport} currency={tripPlan.currency} />
+                <BudgetItem icon="🛟" label="Safety buffer" value={tripPlan.buffer} currency={tripPlan.currency} />
               </div>
             </div>
 
-            {/* ITINERARY */}
+            {/* ── Nearby Places ───────────────────────────────────────── */}
+            <div className="result-section">
+              <div className="result-section-heading">
+                <h3>📍 Nearby places</h3>
+                <p>
+                  {tripPlan.nearbyPlaces.length > 0
+                    ? `${tripPlan.nearbyPlaces.length} places dynamically retrieved near ${tripPlan.destination}.`
+                    : 'No nearby places found — Overpass API may be temporarily slow.'}
+                </p>
+              </div>
+              {tripPlan.nearbyPlaces.length > 0 ? (
+                <div className="nearby-place-list">
+                  {tripPlan.nearbyPlaces.map((place) => (
+                    <div
+                      key={place.place_id}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.5rem',
+                        padding: '0.5rem 0',
+                        borderBottom: '1px solid #f1f5f9',
+                      }}
+                    >
+                      <span>📍</span>
+                      <div>
+                        <strong style={{ fontSize: '0.9rem' }}>{place.name}</strong>
+                        <span
+                          style={{
+                            marginLeft: '0.5rem',
+                            fontSize: '0.8rem',
+                            color: '#64748b',
+                          }}
+                        >
+                          {place.category}
+                          {place.distance !== undefined ? ` · ${place.distance} km` : ''}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p style={{ color: '#64748b', fontSize: '0.875rem' }}>
+                  The itinerary days note where place data was unavailable. Try planning again
+                  in a few minutes if Overpass is slow.
+                </p>
+              )}
+            </div>
+
+            {/* ── Itinerary ───────────────────────────────────────────── */}
             <div className="result-section">
               <div className="result-section-heading">
                 <h3>Day-by-day itinerary</h3>
-
-                <p>
-                  A starting itinerary based on your selected
-                  interests.
-                </p>
+                <p>Built from dynamically discovered places around {tripPlan.destination}.</p>
               </div>
-
               <div className="itinerary-list">
                 {tripPlan.days.map((day) => (
-                  <article
-                    key={day.day}
-                    className="itinerary-card"
-                  >
+                  <article key={day.day} className="itinerary-card">
                     <div className="day-number">
                       <span>DAY</span>
                       <strong>{day.day}</strong>
                     </div>
-
                     <div className="day-content">
                       <h4>{day.title}</h4>
-
                       <ul>
-                        {day.activities.map(
-                          (activity, index) => (
-                            <li key={`${activity}-${index}`}>
-                              <span>✓</span>
-                              {activity}
-                            </li>
-                          )
-                        )}
+                        {day.activities.map((activity, idx) => (
+                          <li key={`${day.day}-${idx}`}>
+                            <span aria-hidden>✓</span>
+                            {activity}
+                          </li>
+                        ))}
                       </ul>
                     </div>
                   </article>
@@ -850,30 +1021,249 @@ export default function PlannerPage() {
               </div>
             </div>
 
-            {/* DESTINATION NOTE */}
-            <div className="destination-note">
-              <span>📍</span>
-
-              <div>
-                <strong>
-                  About {tripPlan.destination}
-                </strong>
-
-                <p>
-                  {destinationDescriptions[
-                    tripPlan.destination
-                  ] ||
-                    'Explore local attractions, food and experiences that match your interests.'}
-                </p>
+            {/* ── Research: Transport Options ─────────────────────────── */}
+            {tripPlan.research?.intercityTransport?.options?.length ? (
+              <div className="result-section">
+                <div className="result-section-heading">
+                  <h3>🚌 Transport Options</h3>
+                  <p>
+                    {tripPlan.research.hasAnyLiveData
+                      ? 'Distance-based estimates from real route data.'
+                      : 'Route estimates — not live booking prices.'}
+                  </p>
+                </div>
+                <div style={{ display: 'grid', gap: '0.75rem' }}>
+                  {tripPlan.research.intercityTransport.options.map((opt, i) => (
+                    <div key={i} className="card" style={{ padding: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <div>
+                        <strong style={{ textTransform: 'capitalize' }}>{opt.mode.replace('_', ' ')}</strong>
+                        {opt.class && <span style={{ color: '#64748b', marginLeft: '0.5rem', fontSize: '0.85rem' }}>{opt.class}</span>}
+                        {opt.durationMinutes && (
+                          <div style={{ fontSize: '0.8rem', color: '#94a3b8', marginTop: '0.2rem' }}>
+                            ~{Math.floor(opt.durationMinutes / 60)}h {opt.durationMinutes % 60}m
+                            {opt.distanceKm ? ` · ${opt.distanceKm} km` : ''}
+                          </div>
+                        )}
+                        <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginTop: '0.2rem' }}>
+                          Source: {opt.source.name} · {opt.source.sourceType}
+                        </div>
+                      </div>
+                      <div style={{ textAlign: 'right' }}>
+                        <strong style={{ color: '#0f172a' }}>
+                          {fmt(opt.priceRange.min)} – {fmt(opt.priceRange.max)}
+                        </strong>
+                        <div style={{ fontSize: '0.75rem', color: '#64748b' }}>per person</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </div>
-            </div>
+            ) : null}
 
+            {/* ── Research: Accommodation ─────────────────────────────────── */}
+            {(tripPlan.research?.accommodation?.results?.length || tripPlan.research?.accommodation?.priceRange?.max) ? (
+              <div className="result-section">
+                <div className="result-section-heading">
+                  <h3>🏨 Accommodation</h3>
+                  <p>
+                    {tripPlan.research!.accommodation.hasLiveData
+                      ? `${tripPlan.research!.accommodation.results.length} hotels found near ${tripPlan.destination}.`
+                      : 'No live hotel data — price range is an estimate from Google price_level indicators.'}
+                  </p>
+                </div>
+                {tripPlan.research!.accommodation.results.slice(0, 6).map((h, i) => (
+                  <div key={i} style={{ padding: '0.6rem 0', borderBottom: '1px solid #f1f5f9', display: 'flex', justifyContent: 'space-between' }}>
+                    <div>
+                      <strong style={{ fontSize: '0.9rem' }}>{h.name}</strong>
+                      {h.address && <div style={{ fontSize: '0.8rem', color: '#64748b' }}>{h.address}</div>}
+                      {h.userRating && <div style={{ fontSize: '0.8rem', color: '#f59e0b' }}>★ {h.userRating}</div>}
+                    </div>
+                    <div style={{ textAlign: 'right', fontSize: '0.85rem' }}>
+                      <span style={{ color: '#64748b' }}>~{fmt(h.pricePerNight.min)}–{fmt(h.pricePerNight.max)}/night</span>
+                      <div style={{ fontSize: '0.7rem', color: '#94a3b8' }}>indicative</div>
+                    </div>
+                  </div>
+                ))}
+                {tripPlan.research!.accommodation.priceRange.max > 0 && (
+                  <div style={{ marginTop: '0.75rem', padding: '0.75rem', background: '#f8fafc', borderRadius: '0.5rem' }}>
+                    <strong>Range: </strong>
+                    {fmt(tripPlan.research!.accommodation.priceRange.min)} – {fmt(tripPlan.research!.accommodation.priceRange.max)} per night
+                    <span style={{ fontSize: '0.75rem', color: '#64748b', marginLeft: '0.5rem' }}>
+                      (from Google price_level indicator — not a booking price)
+                    </span>
+                  </div>
+                )}
+              </div>
+            ) : null}
+
+            {/* ── Research: Food ──────────────────────────────────────────── */}
+            {tripPlan.research?.food?.hasLiveData ? (
+              <div className="result-section">
+                <div className="result-section-heading">
+                  <h3>🍽️ Food & Restaurants</h3>
+                  <p>Restaurants near {tripPlan.destination} from Google Places.</p>
+                </div>
+                {tripPlan.research.food.restaurants.slice(0, 6).map((r, i) => (
+                  <div key={i} style={{ padding: '0.6rem 0', borderBottom: '1px solid #f1f5f9', display: 'flex', justifyContent: 'space-between' }}>
+                    <div>
+                      <strong style={{ fontSize: '0.9rem' }}>{r.name}</strong>
+                      {r.address && <div style={{ fontSize: '0.8rem', color: '#64748b' }}>{r.address}</div>}
+                      {r.userRating && <div style={{ fontSize: '0.8rem', color: '#f59e0b' }}>★ {r.userRating}</div>}
+                    </div>
+                    <div style={{ textAlign: 'right', fontSize: '0.85rem', color: '#64748b' }}>
+                      {'₹'.repeat(r.priceLevel ?? 2)}
+                    </div>
+                  </div>
+                ))}
+                <div style={{ marginTop: '0.75rem', padding: '0.75rem', background: '#f8fafc', borderRadius: '0.5rem' }}>
+                  <strong>Est. daily food cost per person: </strong>
+                  {fmt(tripPlan.research.food.dailyCostPerPerson.min)} – {fmt(tripPlan.research.food.dailyCostPerPerson.max)}
+                  <span style={{ fontSize: '0.75rem', color: '#64748b', marginLeft: '0.5rem' }}>
+                    (3 meals/day from price_level indicator)
+                  </span>
+                </div>
+              </div>
+            ) : null}
+
+            {/* ── Research: Weather ───────────────────────────────────────── */}
+            {tripPlan.research?.weather?.available ? (
+              <div className="result-section">
+                <div className="result-section-heading">
+                  <h3>🌦️ Weather</h3>
+                  <p>Live weather data from OpenWeatherMap.</p>
+                </div>
+                {tripPlan.research.weather.current && (
+                  <div style={{ padding: '0.75rem', background: '#f0f9ff', borderRadius: '0.5rem', marginBottom: '0.75rem' }}>
+                    <strong>Current: </strong>
+                    {tripPlan.research.weather.current.tempC}°C · {tripPlan.research.weather.current.description} ·
+                    Humidity {tripPlan.research.weather.current.humidity}% · Wind {tripPlan.research.weather.current.windKph} km/h
+                  </div>
+                )}
+                {tripPlan.research.weather.forecast.length > 0 && (
+                  <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                    {tripPlan.research.weather.forecast.slice(0, numericDays).map((day) => (
+                      <div key={day.date} style={{ padding: '0.5rem 0.75rem', background: '#f8fafc', borderRadius: '0.5rem', fontSize: '0.8rem', minWidth: '120px' }}>
+                        <div style={{ fontWeight: 600 }}>{day.date}</div>
+                        <div>{day.tempMinC}° – {day.tempMaxC}°C</div>
+                        <div style={{ color: '#64748b' }}>{day.description}</div>
+                        {day.rainProbability !== undefined && (
+                          <div style={{ color: '#3b82f6' }}>🌧 {day.rainProbability}%</div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ) : null}
+
+            {/* ── Research Budget (min/est/max) ────────────────────────────── */}
+            {tripPlan.researchBudget && (
+              <div className="result-section">
+                <div className="result-section-heading">
+                  <h3>📊 Research-Based Cost Estimate</h3>
+                  <p>Calculated from provider data. Sources shown per line.</p>
+                </div>
+                <div style={{ background: '#f8fafc', borderRadius: '0.75rem', padding: '1.25rem' }}>
+                  {[
+                    { label: '🏨 Accommodation', item: tripPlan.researchBudget.accommodation },
+                    { label: '🍽️ Food', item: tripPlan.researchBudget.food },
+                    { label: '🚌 Transport', item: tripPlan.researchBudget.intercityTransport },
+                    { label: '🚕 Local transport', item: tripPlan.researchBudget.localTransport },
+                    { label: '🎟️ Activities', item: tripPlan.researchBudget.activities },
+                    { label: '🛡️ Buffer', item: tripPlan.researchBudget.buffer },
+                  ].map(({ label, item }) => (
+                    <div key={label} style={{ display: 'flex', justifyContent: 'space-between', padding: '0.4rem 0', borderBottom: '1px solid #e2e8f0', fontSize: '0.9rem' }}>
+                      <span>{label}</span>
+                      <div style={{ textAlign: 'right' }}>
+                        <strong>{fmt(item.lineTotal)}</strong>
+                        {'isLiveData' in item && (
+                          <span style={{ marginLeft: '0.5rem', fontSize: '0.7rem', color: item.isLiveData ? '#16a34a' : '#94a3b8' }}>
+                            {item.isLiveData ? '● live' : '○ est.'}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                  <div style={{ marginTop: '1rem', display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '0.5rem', textAlign: 'center' }}>
+                    <div style={{ background: '#ecfdf5', borderRadius: '0.5rem', padding: '0.75rem' }}>
+                      <div style={{ fontSize: '0.75rem', color: '#64748b' }}>Minimum</div>
+                      <strong style={{ color: '#16a34a' }}>{fmt(tripPlan.researchBudget.minimum)}</strong>
+                    </div>
+                    <div style={{ background: '#eff6ff', borderRadius: '0.5rem', padding: '0.75rem' }}>
+                      <div style={{ fontSize: '0.75rem', color: '#64748b' }}>Estimated</div>
+                      <strong style={{ color: '#2563eb' }}>{fmt(tripPlan.researchBudget.total)}</strong>
+                    </div>
+                    <div style={{ background: '#fff7ed', borderRadius: '0.5rem', padding: '0.75rem' }}>
+                      <div style={{ fontSize: '0.75rem', color: '#64748b' }}>Maximum</div>
+                      <strong style={{ color: '#ea580c' }}>{fmt(tripPlan.researchBudget.maximum)}</strong>
+                    </div>
+                  </div>
+                  <div style={{ marginTop: '0.75rem', display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '0.5rem', textAlign: 'center', fontSize: '0.8rem' }}>
+                    <div>
+                      <div style={{ color: '#64748b' }}>Per person</div>
+                      <strong>{fmt(tripPlan.researchBudget.perPerson)}</strong>
+                    </div>
+                    <div>
+                      <div style={{ color: '#64748b' }}>Per day</div>
+                      <strong>{fmt(tripPlan.researchBudget.perDay)}</strong>
+                    </div>
+                    <div>
+                      <div style={{ color: '#64748b' }}>Per person/day</div>
+                      <strong>{fmt(tripPlan.researchBudget.perPersonPerDay)}</strong>
+                    </div>
+                  </div>
+                </div>
+                <details style={{ marginTop: '0.75rem', fontSize: '0.8rem', color: '#64748b' }}>
+                  <summary style={{ cursor: 'pointer' }}>Show calculation breakdown</summary>
+                  <pre style={{ marginTop: '0.5rem', whiteSpace: 'pre-wrap', background: '#f1f5f9', padding: '0.75rem', borderRadius: '0.5rem' }}>
+                    {tripPlan.researchBudget.breakdown}
+                  </pre>
+                </details>
+              </div>
+            )}
+
+            {/* ── Agent Pipeline Trace ────────────────────────────────── */}
+            {tripPlan.agent?.steps && tripPlan.agent.steps.length > 0 && (
+              <div className="planning-pipeline">
+                <div className="result-section-heading">
+                  <h3>How this plan was built</h3>
+                  <p>Every step is traceable — no black-box AI decisions.</p>
+                </div>
+                <div className="pipeline-trace">
+                  {tripPlan.agent.steps.map((step, idx) => (
+                    <div key={step.tool} className="pipeline-trace-item">
+                      <span className="pipeline-trace-number">
+                        {String(idx + 1).padStart(2, '0')}
+                      </span>
+                      <div>
+                        <strong>
+                          {step.tool}
+                          <span
+                            style={{
+                              marginLeft: '0.5rem',
+                              fontSize: '0.75rem',
+                              color: step.status === 'completed' ? '#16a34a' : '#9ca3af',
+                            }}
+                          >
+                            [{step.status}]
+                          </span>
+                        </strong>
+                        <span>{step.summary}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* ── Disclaimer ──────────────────────────────────────────── */}
             <div className="demo-notice">
-              <strong>Important:</strong> These are planning estimates
-              for the first local prototype. They are not live hotel,
-              transport, activity, weather, or availability prices.
-              We will connect real APIs before treating the results
-              as bookable travel information.
+              <strong>Data sources:</strong> Tourist places from Google Places / OpenStreetMap.
+              Hotel &amp; food prices are indicative estimates from Google price_level indicators — not live booking prices.
+              Transport fares are distance-based estimates — not live bus/train/flight tickets.
+              Always verify prices with official providers before booking.
+              <br />
+              <span style={{ fontSize: '0.8rem' }}>Place data © OpenStreetMap contributors (ODbL).</span>
             </div>
           </section>
         )}
@@ -882,22 +1272,37 @@ export default function PlannerPage() {
   );
 }
 
+export default function PlannerPage() {
+  return (
+    <Suspense fallback={<div className="container planner-page" />}>
+      <PlannerPageContent />
+    </Suspense>
+  );
+}
+
 function BudgetItem({
   icon,
   label,
   value,
+  currency = 'INR',
 }: {
   icon: string;
   label: string;
   value: number;
+  currency?: string;
 }) {
   return (
     <div className="budget-item">
-      <span className="budget-icon">{icon}</span>
-
+      <span className="budget-icon" aria-hidden>{icon}</span>
       <div>
         <span>{label}</span>
-        <strong>{formatCurrency(value)}</strong>
+        <strong>
+          {new Intl.NumberFormat('en-IN', {
+            style: 'currency',
+            currency,
+            maximumFractionDigits: 0,
+          }).format(value)}
+        </strong>
       </div>
     </div>
   );

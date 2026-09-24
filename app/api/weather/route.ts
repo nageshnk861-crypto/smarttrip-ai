@@ -1,20 +1,36 @@
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
+import { WEATHER_API_BASE_URL, WEATHER_UNITS, WEATHER_CACHE_REVALIDATE_SECONDS } from '../../../lib/config';
 
-export async function GET(request) {
-    const { searchParams } = new URL(request.url);
-    const city = searchParams.get('city');
-    const apiKey = process.env.WEATHER_API_KEY; // Ensure you have your API key in the environment variables
+export async function GET(request: NextRequest) {
+  const { searchParams } = new URL(request.url);
+  const city = searchParams.get('city');
+  const apiKey = process.env.WEATHER_API_KEY ?? '';
 
-    if (!city) {
-        return NextResponse.json({ error: 'City is required' }, { status: 400 });
-    }
+  if (!city) {
+    return NextResponse.json({ error: 'city parameter is required.' }, { status: 400 });
+  }
 
-    const response = await fetch(`https://api.openweathermap.org/data/2.5/weather?q=${city}&appid=${apiKey}&units=metric`);
+  if (!apiKey) {
+    return NextResponse.json(
+      { error: 'Weather information is currently unavailable.', code: 'PROVIDER_NOT_CONFIGURED' },
+      { status: 503 },
+    );
+  }
+
+  try {
+    const url = `${WEATHER_API_BASE_URL}?q=${encodeURIComponent(city)}&appid=${apiKey}&units=${WEATHER_UNITS}`;
+    const response = await fetch(url, { next: { revalidate: WEATHER_CACHE_REVALIDATE_SECONDS } });
 
     if (!response.ok) {
-        return NextResponse.json({ error: 'Failed to fetch weather data' }, { status: response.status });
+      return NextResponse.json(
+        { error: 'Weather information is currently unavailable.' },
+        { status: 502 },
+      );
     }
 
     const data = await response.json();
-    return NextResponse.json(data);
+    return NextResponse.json({ data, units: WEATHER_UNITS, isDemo: false });
+  } catch {
+    return NextResponse.json({ error: 'Weather information is currently unavailable.' }, { status: 502 });
+  }
 }
