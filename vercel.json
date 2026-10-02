@@ -1,27 +1,32 @@
 {
-  "version": 2,
-  "builds": [
-    {
-      "src": "next.config.ts",
-      "use": "@vercel/next"
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
+    "frontend": {
+      "rootDirectory": "frontend",
+      "framework": "nextjs",
+      "bindings": [
+        {
+          "type": "service",
+          "service": "backend",
+          "format": "url",
+          "env": "BACKEND_URL"
+        }
+      ]
+    },
+    "backend": {
+      "rootDirectory": "backend"
     }
-  ],
+  },
   "routes": [
     {
       "src": "/api/(.*)",
-      "dest": "/app/api/$1"
+      "service": "backend",
+      "dest": "/api/$1"
     },
     {
       "src": "/(.*)",
-      "dest": "/app/$1"
+      "service": "frontend",
+      "dest": "/$1"
     }
-  ],
-  "env": {
-    "NEXT_PUBLIC_SUPABASE_URL": "@supabase-url",
-    "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY": "@supabase-anon-key",
-    "STRIPE_SECRET_KEY": "@stripe-secret-key",
-    "OPENAI_API_KEY": "@openai-api-key",
-    "WEATHER_API_KEY": "@weather-api-key",
-    "NEXT_PUBLIC_GOOGLE_MAPS_API_KEY": "@maps-api-key"
-  }
+  ]
 }
