@@ -176,11 +176,11 @@ export class OsmTouristPlacesProvider implements TouristPlacesProvider {
     });
 
     const tagFilters = [
-      '[tourism~"attraction|museum|viewpoint|gallery|theme_park|zoo|aquarium|artwork"]',
-      '[historic~"castle|palace|monument|memorial|ruins|archaeological_site|fort|battlefield|building"]',
-      '[natural~"peak|beach|waterfall|cave_entrance|cliff|bay|hot_spring"]',
+      '[tourism~"attraction|museum|viewpoint|gallery|hotel|hostel|guest_house|theme_park|zoo|aquarium|artwork"]',
+      '[historic]',
+      '[natural~"waterfall|peak|beach|cave_entrance|cliff|bay|hot_spring"]',
       '[leisure~"park|nature_reserve|garden"]',
-      '[amenity~"place_of_worship|theatre|arts_centre|cinema"]',
+      '[amenity~"restaurant|cafe|place_of_worship|theatre|arts_centre|cinema"]',
     ];
 
     // Add interest-specific tags
@@ -231,10 +231,9 @@ export class OsmTouristPlacesProvider implements TouristPlacesProvider {
             address: address || undefined,
             openingHours: tags.opening_hours,
             distanceKm: haversineKm(req.latitude, req.longitude, lat, lng),
-            // OSM rarely has entry fee data — only include when explicitly tagged
-            entryFee: tags.fee === 'yes' && tags.charge
-              ? { min: 0, max: 0, currency: req.currency } // charge format is not standardized
-              : undefined,
+            // OSM rarely has entry fee data — do not fabricate one
+            entryFee: null,
+            entryFeeSource: tags.fee === 'yes' && tags.charge ? 'provider' : 'unknown',
             hasFeeData: !!(tags.fee === 'yes' && tags.charge),
             source,
           }];
@@ -267,6 +266,7 @@ export class OsmHotelProvider implements HotelProvider {
       hasLiveData: false,
       results: [],
       priceRange: { min: 0, max: 0, currency: req.currency },
+      availability: 'price_unavailable',
       nights: req.days,
       tier,
       source: unavailableSource('Overpass API unavailable'),
@@ -327,9 +327,10 @@ export class OsmHotelProvider implements HotelProvider {
             starRating: tags.stars ? Number(tags.stars) : undefined,
             roomType: tags.tourism ?? tags.amenity,
             // OSM does NOT provide booking prices.
-            // pricePerNight is { min: 0, max: 0 } to signal "unavailable".
-            // The UI must display "Booking price unavailable from this free data source."
-            pricePerNight: { min: 0, max: 0, currency: req.currency },
+            // pricePerNight and price are null with availability = 'price_unavailable'.
+            pricePerNight: null,
+            price: null,
+            availability: 'price_unavailable',
             amenities: [
               tags.internet_access === 'wlan' ? 'WiFi' : undefined,
               tags.swimming_pool === 'yes' ? 'Swimming pool' : undefined,
@@ -349,8 +350,9 @@ export class OsmHotelProvider implements HotelProvider {
         available: results.length > 0,
         hasLiveData: results.length > 0,
         results,
-        // priceRange is 0/0 because OSM has no pricing — budget engine will use config fallback
+        // priceRange is 0/0 because OSM has no pricing — budget engine will track as estimated
         priceRange: { min: 0, max: 0, currency: req.currency },
+        availability: 'price_unavailable',
         nights: req.days,
         tier,
         source,
@@ -418,10 +420,11 @@ export class OsmFoodProvider implements FoodProvider {
             latitude: lat,
             longitude: lng,
             // OSM does NOT provide menu prices.
-            // priceLevel is undefined; mealCostPerPerson is undefined.
-            // The UI must show "Price unavailable" rather than inventing a cost.
+            // priceLevel is undefined; mealCostPerPerson and price are null.
+            // The UI shows "Price unavailable" rather than inventing a cost.
             priceLevel: undefined,
-            mealCostPerPerson: undefined,
+            mealCostPerPerson: null,
+            price: null,
             source: {
               ...source,
               name: source.name + ' — menu price unavailable from OSM',
@@ -435,7 +438,6 @@ export class OsmFoodProvider implements FoodProvider {
         hasLiveData: restaurants.length > 0,
         restaurants,
         // dailyCostPerPerson is 0/0 because OSM has no food pricing.
-        // The budget engine will use config-based estimate and label it clearly.
         dailyCostPerPerson: { min: 0, max: 0, currency: req.currency },
         tier,
         source,

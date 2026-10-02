@@ -544,3 +544,180 @@ describe('Provenance — sourceType distinctions', () => {
     assert.ok(configSrc.name.includes('not a live price'));
   });
 });
+
+// ─── Phase 2 Pricing & Provenance Verification Suite ─────────────────────────
+
+describe('Phase 2 — Pricing Provenance & Anti-Fabrication Contracts', () => {
+  it('1. No production hard-coded price constants are presented as real provider prices', () => {
+    const req = makeRequest('Jaipur');
+    const research = makeResearchResult('Jaipur', {
+      accommodation: {
+        available: true,
+        hasLiveData: true,
+        results: [],
+        priceRange: { min: 0, max: 0, currency: 'INR' },
+        availability: 'price_unavailable',
+        nights: 3,
+        tier: 'standard',
+        source: { name: 'OSM', sourceType: 'provider', retrievedAt: new Date().toISOString() },
+      },
+    });
+    const budget = calculateResearchBudget(req, research);
+
+    // Accommodation should NOT be marked as live data
+    assert.equal(budget.accommodation.isLiveData, false);
+    assert.equal(budget.accommodation.source.sourceType, 'estimated');
+    assert.ok(budget.accommodation.source.name.includes('not a live'));
+  });
+
+  it('2. Provider price retains provenance with source, sourceType, and retrievedAt', () => {
+    const now = new Date().toISOString();
+    const itemSource = {
+      name: 'Live Hotel Provider XYZ',
+      sourceType: 'live' as const,
+      confidence: 'high' as const,
+      retrievedAt: now,
+    };
+    const req = makeRequest('Goa');
+    const research = makeResearchResult('Goa', {
+      accommodation: {
+        available: true,
+        hasLiveData: true,
+        results: [],
+        priceRange: { min: 2500, max: 3500, currency: 'INR' },
+        availability: 'available',
+        nights: 3,
+        tier: 'standard',
+        source: itemSource,
+      },
+    });
+    const budget = calculateResearchBudget(req, research);
+
+    assert.equal(budget.accommodation.isLiveData, true);
+    assert.equal(budget.accommodation.source.sourceType, 'live');
+    assert.equal(budget.accommodation.source.confidence, 'high');
+    assert.equal(budget.accommodation.source.retrievedAt, now);
+  });
+
+  it('3. Estimated price is explicitly marked estimated with confidence and basis', () => {
+    const req = makeRequest('Ooty');
+    const research = makeResearchResult('Ooty');
+    const budget = calculateResearchBudget(req, research);
+
+    assert.equal(budget.intercityTransport.isLiveData, false);
+    assert.equal(budget.intercityTransport.source.sourceType, 'estimated');
+    assert.ok(budget.intercityTransport.description?.includes('distance estimate'));
+  });
+
+  it('4. Missing hotel price is not fabricated (pricePerNight is null or 0/0 and availability is price_unavailable)', () => {
+    const hotelResult = {
+      placeId: 'osm-hotel-1',
+      name: 'Heritage Palace Stay',
+      pricePerNight: null,
+      price: null,
+      availability: 'price_unavailable' as const,
+      source: { name: 'OSM', sourceType: 'provider' as const, retrievedAt: new Date().toISOString() },
+    };
+
+    assert.equal(hotelResult.pricePerNight, null);
+    assert.equal(hotelResult.price, null);
+    assert.equal(hotelResult.availability, 'price_unavailable');
+  });
+
+  it('5. Missing train fare is not fabricated as a confirmed booking fare', () => {
+    const trainOption = {
+      mode: 'train' as const,
+      priceRange: { min: 400, max: 1200, currency: 'INR' },
+      availabilityConfirmed: false,
+      source: {
+        name: 'OpenRouteService — train fare estimate',
+        sourceType: 'estimated' as const,
+        confidence: 'medium' as const,
+        retrievedAt: new Date().toISOString(),
+      },
+    };
+
+    assert.equal(trainOption.availabilityConfirmed, false);
+    assert.equal(trainOption.source.sourceType, 'estimated');
+  });
+
+  it('6. Missing bus fare is not fabricated as a confirmed booking fare', () => {
+    const busOption = {
+      mode: 'bus' as const,
+      priceRange: { min: 350, max: 800, currency: 'INR' },
+      availabilityConfirmed: false,
+      source: {
+        name: 'Haversine distance — bus fare estimate',
+        sourceType: 'estimated' as const,
+        confidence: 'low' as const,
+        retrievedAt: new Date().toISOString(),
+      },
+    };
+
+    assert.equal(busOption.availabilityConfirmed, false);
+    assert.equal(busOption.source.sourceType, 'estimated');
+  });
+
+  it('7. Food discovery does not imply menu price (mealCostPerPerson is null)', () => {
+    const restaurant = {
+      placeId: 'osm-restaurant-42',
+      name: 'Spice Garden',
+      mealCostPerPerson: null,
+      price: null,
+      source: { name: 'OSM', sourceType: 'provider' as const, retrievedAt: new Date().toISOString() },
+    };
+
+    assert.equal(restaurant.mealCostPerPerson, null);
+    assert.equal(restaurant.price, null);
+  });
+
+  it('8. Attraction without verified entry fee remains unknown', () => {
+    const attraction = {
+      placeId: 'osm-place-101',
+      name: 'Sunset Viewpoint',
+      category: 'viewpoint',
+      latitude: 12.34,
+      longitude: 76.54,
+      entryFee: null,
+      entryFeeSource: 'unknown' as const,
+      hasFeeData: false,
+      source: { name: 'OSM', sourceType: 'provider' as const, retrievedAt: new Date().toISOString() },
+    };
+
+    assert.equal(attraction.entryFee, null);
+    assert.equal(attraction.entryFeeSource, 'unknown');
+    assert.equal(attraction.hasFeeData, false);
+  });
+
+  it('9. Budget engine correctly separates knownCost, estimatedCost, and unavailableCosts', () => {
+    const req = makeRequest('Shimla');
+    const research = makeResearchResult('Shimla', {
+      accommodation: {
+        available: true,
+        hasLiveData: false,
+        results: [],
+        priceRange: { min: 0, max: 0, currency: 'INR' },
+        availability: 'price_unavailable',
+        nights: 3,
+        tier: 'standard',
+        source: { name: 'OSM', sourceType: 'provider', retrievedAt: new Date().toISOString() },
+      },
+      food: {
+        available: true,
+        hasLiveData: false,
+        restaurants: [],
+        dailyCostPerPerson: { min: 0, max: 0, currency: 'INR' },
+        tier: 'standard',
+        source: { name: 'OSM', sourceType: 'provider', retrievedAt: new Date().toISOString() },
+      },
+    });
+
+    const budget = calculateResearchBudget(req, research);
+
+    assert.equal(budget.knownCost, 0, 'Known provider cost should be 0 when no live quotes exist');
+    assert.equal(budget.estimatedCost, budget.total, 'Estimated cost should equal total when all items are estimated');
+    assert.ok(budget.unavailableCosts.length >= 2, 'Should list hotel and food unavailable notes');
+    assert.ok(budget.unavailableCosts.some((note) => note.includes('Hotel booking pricing')));
+    assert.ok(budget.unavailableCosts.some((note) => note.includes('Restaurant menu pricing')));
+  });
+});

@@ -1,0 +1,25 @@
+{
+  "name": "smarttrip-backend",
+  "version": "1.0.0",
+  "description": "SmartTrip AI Travel Planner Backend (Express + TypeScript)",
+  "private": true,
+  "main": "server.ts",
+  "scripts": {
+    "dev": "tsx watch server.ts",
+    "build": "tsc",
+    "start": "tsx server.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.116.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.3"
+  }
+}

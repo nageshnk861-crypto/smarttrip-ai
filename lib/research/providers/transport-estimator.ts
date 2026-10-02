@@ -43,12 +43,12 @@ import { NOMINATIM_BASE_URL, NOMINATIM_USER_AGENT } from '../../config';
 function nowIso() { return new Date().toISOString(); }
 function expiresIn(m: number) { return new Date(Date.now() + m * 60_000).toISOString(); }
 
-function estimatedSource(note: string): DataSource {
-  return { name: note, sourceType: 'estimated', retrievedAt: nowIso(), expiresAt: expiresIn(120) };
+function estimatedSource(note: string, confidence: 'high' | 'medium' | 'low' = 'medium'): DataSource {
+  return { name: note, sourceType: 'estimated', confidence, retrievedAt: nowIso(), expiresAt: expiresIn(120) };
 }
 
-function providerSource(name: string): DataSource {
-  return { name, sourceType: 'provider', retrievedAt: nowIso(), expiresAt: expiresIn(60) };
+function providerSource(name: string, confidence: 'high' | 'medium' | 'low' = 'high'): DataSource {
+  return { name, sourceType: 'provider', confidence, retrievedAt: nowIso(), expiresAt: expiresIn(60) };
 }
 
 // ─── Haversine (straight-line fallback) ──────────────────────────────────────
@@ -138,8 +138,20 @@ const PER_KM = {
   flight: { baseMin: 1_500, baseMax: 3_000, perKmMin: 2.5, perKmMax: 7 },
 } as const;
 
+import { estimateBusFare } from '../../transport/bus-rate-model';
+
 function estimateBus(km: number, currency: string): PriceRange {
-  return { min: Math.round(km * PER_KM.bus.min), max: Math.round(km * PER_KM.bus.max), currency };
+  const estimate = estimateBusFare({
+    distanceKm: km,
+    category: 'EXPRESS',
+    travelers: 1,
+    roundTrip: false,
+  });
+  return {
+    min: estimate.oneWay?.low || Math.round(km * 1.5),
+    max: estimate.oneWay?.high || Math.round(km * 3.5),
+    currency,
+  };
 }
 function estimateTrain(km: number, currency: string): PriceRange {
   return { min: Math.round(km * PER_KM.train.min), max: Math.round(km * PER_KM.train.max), currency };
@@ -237,7 +249,7 @@ export class DistanceBasedTransportProvider implements TransportProvider {
     if (busPrice.max > 0) {
       options.push({
         mode: 'bus',
-        class: 'Non-AC to AC Sleeper (estimate)',
+        class: 'Express / Deluxe Planning Estimate (₹1.50–₹3.50/km)',
         departureName: req.origin,
         arrivalName: req.destination,
         durationMinutes: durationMin,
@@ -246,7 +258,7 @@ export class DistanceBasedTransportProvider implements TransportProvider {
         availabilityConfirmed: false,
         source: {
           ...distanceSource,
-          name: distanceSource.name + ` — bus fare estimate (₹${PER_KM.bus.min}–₹${PER_KM.bus.max}/km)`,
+          name: distanceSource.name + ` — bus fare planning estimate (₹1.50–₹3.50/km, expected ₹2.50/km)`,
           sourceType: 'estimated',
         },
       });

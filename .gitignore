@@ -1,24 +1,25 @@
-# Environment secrets
-.env
-.env.local
-.env.*.local
+# dependencies
+node_modules
+.pnp
+.pnp.js
 
-# Firebase credentials
-serviceAccountKey.json
-service-account.json
-firebase-service-account.json
-firebase-adminsdk*.json
-
-# Next.js
+# build outputs
 .next/
+dist/
+build/
+out/
 
-# Dependencies
-node_modules/
+# env files
+.env*.local
+.env
 
-# Logs
-*.log
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# OS files
+# system
 .DS_Store
-Thumbs.db
-*.tsbuildinfo
+*.pem
+.vscode/
+tsconfig.tsbuildinfo

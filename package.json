@@ -1,50 +1,26 @@
 {
   "name": "smarttrip-app",
-  "type": "module",
   "version": "1.0.0",
-  "description": "A travel planning application that integrates various APIs for maps, AI, weather, hotels, routing, and payments.",
-  "main": "index.js",
+  "description": "SmartTrip AI Travel Planner Monorepo (Frontend + Backend + Database)",
+  "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "lint": "eslint .",
-    "test": "node --import tsx/esm --test __tests__/**/*.ts"
-  },
-  "exports": {
-    "./lib/providers/places": "./lib/providers/places.ts"
+    "install:all": "npm --prefix frontend install && npm --prefix backend install",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "dev:backend": "npm --prefix backend run dev",
+    "build:frontend": "npm --prefix frontend run build",
+    "build:backend": "npm --prefix backend run build",
+    "build": "npm run build:backend && npm run build:frontend",
+    "lint:frontend": "npm --prefix frontend run lint"
   },
   "keywords": [
     "travel",
     "planning",
     "nextjs",
-    "react",
-    "tailwindcss",
-    "pwa"
+    "express",
+    "ai",
+    "ollama",
+    "supabase"
   ],
-  "author": "Your Name",
-  "license": "MIT",
-  "dependencies": {
-    "@supabase/ssr": "^0.12.7",
-    "@supabase/supabase-js": "^2.116.0",
-    "lucide-react": "^1.47.0",
-    "next": "latest",
-    "react": "latest",
-    "react-dom": "latest",
-    "stripe": "^8.0.0",
-    "tailwindcss": "^2.2.19"
-  },
-  "devDependencies": {
-    "@types/react": "19.3.0",
-    "eslint": "^9.0.0",
-    "eslint-config-next": "latest",
-    "ts-node": "^10.9.2",
-    "tsx": "^4.23.15",
-    "typescript": "^5.9.3"
-  },
-  "browserslist": [
-    ">0.2%",
-    "not dead",
-    "not op_mini all"
-  ]
+  "author": "SmartTrip Team",
+  "license": "MIT"
 }

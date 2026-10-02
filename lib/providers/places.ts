@@ -121,32 +121,32 @@ export type NearbyOptions = {
  * No destination names are hardcoded here — this is purely tag logic.
  */
 const INTEREST_TAG_GROUPS: Record<string, string[]> = {
-  Nature:        ['[tourism=viewpoint]', '[natural~"peak|volcano|waterfall|bay|cave_entrance|cliff"]', '[leisure=nature_reserve]'],
+  Nature:        ['[tourism=viewpoint]', '[natural~"waterfall|peak|volcano|bay|cave_entrance|cliff"]', '[leisure~"park|nature_reserve|garden"]'],
   Beaches:       ['[natural=beach]', '[leisure=beach_resort]'],
   Mountains:     ['[natural~"peak|ridge|cliff|valley"]', '[tourism=viewpoint]'],
-  History:       ['[historic~"castle|palace|monument|memorial|ruins|archaeological_site|fort|battlefield"]', '[tourism=museum]'],
-  Culture:       ['[tourism~"museum|gallery|artwork"]', '[amenity~"theatre|cinema|arts_centre"]', '[historic=building]'],
-  Temples:       ['[amenity=place_of_worship]', '[historic~"temple|monastery|shrine"]'],
+  History:       ['[historic]', '[tourism=museum]'],
+  Culture:       ['[tourism~"museum|gallery|artwork"]', '[amenity~"theatre|cinema|arts_centre"]', '[historic]'],
+  Temples:       ['[amenity=place_of_worship]', '[historic~"temple|monastery|shrine"]', '[religion]'],
   Wildlife:      ['[leisure~"zoo|wildlife_hide|nature_reserve"]', '[tourism=zoo]'],
   Adventure:     ['[leisure~"climbing|water_park|slipway"]', '[sport~"climbing|paragliding|rafting|surfing"]'],
   Food:          ['[amenity~"restaurant|cafe|marketplace|food_court"]', '[tourism=restaurant]'],
   Shopping:      ['[shop~"mall|market|department_store"]', '[tourism=shopping_mall]'],
-  Photography:   ['[tourism~"viewpoint|attraction|artwork"]', '[natural~"peak|waterfall|beach"]'],
-  Architecture:  ['[historic~"building|castle|palace|cathedral|mosque|church"]', '[tourism~"attraction|museum"]'],
+  Photography:   ['[tourism~"viewpoint|attraction|gallery|artwork"]', '[natural~"waterfall|peak|beach"]'],
+  Architecture:  ['[historic]', '[tourism~"attraction|museum"]'],
   Nightlife:     ['[amenity~"bar|nightclub|pub|casino"]'],
   Wellness:      ['[leisure~"spa|swimming_pool|sports_centre"]', '[amenity~"spa|sauna"]'],
-  Relaxation:    ['[tourism~"resort|hotel|viewpoint"]', '[leisure~"beach_resort|spa|park"]'],
-  Museums:       ['[tourism=museum]', '[historic~"museum|gallery"]'],
-  Parks:         ['[leisure~"park|garden|nature_reserve"]', '[tourism=park]'],
+  Relaxation:    ['[tourism~"resort|hotel|hostel|guest_house|viewpoint"]', '[leisure~"park|beach_resort|spa"]'],
+  Museums:       ['[tourism~"museum|gallery"]', '[historic]'],
+  Parks:         ['[leisure=park]', '[leisure~"park|garden|nature_reserve"]', '[tourism=park]'],
 };
 
-/** Default tag groups used when no interests are specified. */
+/** Default tag groups used when no interests are specified (comprehensive nearby visiting places). */
 const DEFAULT_TAG_GROUPS = [
-  '[tourism~"attraction|museum|viewpoint|gallery|theme_park|zoo|aquarium"]',
-  '[historic~"castle|palace|monument|ruins|archaeological_site"]',
-  '[natural~"peak|beach|waterfall"]',
-  '[leisure=park]',
-  '[amenity~"museum|place_of_worship"]',
+  '[tourism~"attraction|museum|viewpoint|gallery|hotel|hostel|guest_house|theme_park|zoo|aquarium"]',
+  '[historic]',
+  '[natural~"waterfall|peak|beach"]',
+  '[leisure~"park|garden|nature_reserve"]',
+  '[amenity~"restaurant|cafe|place_of_worship"]',
 ];
 
 function buildTagClauses(interests: string[]): string[] {
@@ -156,8 +156,12 @@ function buildTagClauses(interests: string[]): string[] {
     const groups = INTEREST_TAG_GROUPS[interest];
     if (groups) groups.forEach((g) => clauses.add(g));
   }
-  // Always include basic attractions as a safety net
-  clauses.add('[tourism~"attraction|viewpoint"]');
+  // Always include primary attractions, viewpoints, historic sites, and essential tourist POIs
+  clauses.add('[tourism~"attraction|museum|viewpoint|gallery|hotel|hostel|guest_house"]');
+  clauses.add('[historic]');
+  clauses.add('[leisure=park]');
+  clauses.add('[natural=waterfall]');
+  clauses.add('[amenity~"restaurant|cafe"]');
   return [...clauses];
 }
 
@@ -591,9 +595,11 @@ class FallbackPlacesProvider implements PlacesProvider {
 
   async nearby(lat: number, lng: number, options: NearbyOptions = {}) {
     try {
-      return await this.primary.nearby(lat, lng, options);
+      const results = await this.primary.nearby(lat, lng, options);
+      if (results && results.length > 0) return results;
+      return await this.fallback.nearby(lat, lng, options);
     } catch {
-      return this.fallback.nearby(lat, lng, options);
+      return await this.fallback.nearby(lat, lng, options);
     }
   }
 }

@@ -288,14 +288,20 @@ function buildOllamaPrompt(
     ? [
         `  Accommodation:    ${currency} ${researchBudget.accommodation.lineTotal.toLocaleString()} (${researchBudget.accommodation.isLiveData ? 'provider data' : 'estimated'})`,
         `  Food:             ${currency} ${researchBudget.food.lineTotal.toLocaleString()} (${researchBudget.food.isLiveData ? 'provider data' : 'estimated'})`,
-        `  Transport:        ${currency} ${researchBudget.intercityTransport.lineTotal.toLocaleString()} (estimated)`,
-        `  Local transport:  ${currency} ${researchBudget.localTransport.lineTotal.toLocaleString()} (estimated)`,
-        `  Activities:       ${currency} ${researchBudget.activities.lineTotal.toLocaleString()} (estimated)`,
+        `  Transport:        ${currency} ${researchBudget.intercityTransport.lineTotal.toLocaleString()} (distance estimate)`,
+        `  Local transport:  ${currency} ${researchBudget.localTransport.lineTotal.toLocaleString()} (estimate)`,
+        `  Activities:       ${currency} ${researchBudget.activities.lineTotal.toLocaleString()} (estimate)`,
         `  Buffer:           ${currency} ${researchBudget.buffer.lineTotal.toLocaleString()}`,
-        `  TOTAL:            ${currency} ${total.toLocaleString()}`,
-        `  Remaining:        ${currency} ${remaining.toLocaleString()}`,
+        `  Known Provider Costs:  ${currency} ${researchBudget.knownCost.toLocaleString()}`,
+        `  Estimated Costs:       ${currency} ${researchBudget.estimatedCost.toLocaleString()}`,
+        `  TOTAL:                 ${currency} ${total.toLocaleString()}`,
+        `  Remaining:             ${currency} ${remaining.toLocaleString()}`,
       ].join('\n')
     : `  TOTAL: ${currency} ${total.toLocaleString()} (config estimate)`;
+
+  const unavailableNote = researchBudget?.unavailableCosts.length
+    ? `Unavailable live prices: ${researchBudget.unavailableCosts.join('; ')}`
+    : 'All components estimated from available data.';
 
   return `Create a concise travel recommendation.
 
@@ -308,8 +314,9 @@ Trip:
 - Style: ${request.travelStyle}
 - Interests: ${request.interests.join(', ')}
 
-Budget breakdown (DO NOT recalculate):
+Budget summary (DO NOT recalculate or invent any numbers):
 ${budgetLines}
+${unavailableNote}
 
 Weather: ${
     research?.weather.current
@@ -317,12 +324,15 @@ Weather: ${
       : 'not available'
   }
 
-STRICT RULES:
-1. Do NOT change any budget number.
-2. Do NOT invent place names — use ONLY the verified places below.
-3. Explain why ${plan.destination} suits the user's interests.
-4. Give practical, specific travel tips for ${plan.destination}.
-5. Keep response under 200 words.
+STRICT ANTI-HALLUCINATION RULES:
+1. NEVER invent or alter prices, costs, fees, or budget numbers.
+2. NEVER invent hotel availability or live booking rates.
+3. NEVER invent train or bus ticket fares — describe transit costs strictly as distance-based estimates.
+4. NEVER claim an OpenStreetMap / Overpass attraction or restaurant has a specific menu price or entry fee unless explicitly stated in the research data.
+5. NEVER change or substitute the destination (${plan.destination}) with another city (e.g., do not substitute Bangalore, Mysore, Coorg, or Kerala).
+6. Use ONLY research data supplied by the application; explain the research rather than acting as a source of truth.
+7. Give practical, specific travel tips for ${plan.destination} within ${request.days} days.
+8. Keep response under 200 words.
 
 Verified places (ONLY these may be mentioned):
 ${

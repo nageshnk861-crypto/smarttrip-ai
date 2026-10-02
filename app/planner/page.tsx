@@ -1,8 +1,12 @@
 'use client';
 
-import { FormEvent, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { FormEvent, Suspense, useMemo, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { DestinationSearch, PlaceDetails } from '../../components/planner/DestinationSearch';
+import {
+  StartingLocationInput,
+  type OriginLocation,
+} from '../../components/planner/StartingLocationInput';
 import { parseTripPrompt } from '../../lib/planner/validators';
 import { ALL_INTEREST_OPTIONS } from '../../lib/config';
 import {
@@ -94,6 +98,9 @@ type TripPlan = {
     currency: string;
     remaining: number;
     breakdown: string;
+    knownCost?: number;
+    estimatedCost?: number;
+    unavailableCosts?: string[];
   };
   /** Full research result for transport, hotel, food, weather sections. */
   research?: {
@@ -105,12 +112,12 @@ type TripPlan = {
       }>;
     };
     accommodation: {
-      results: Array<{ name: string; address?: string; pricePerNight: { min: number; max: number; currency: string }; userRating?: number }>;
+      results: Array<{ name: string; address?: string; pricePerNight?: { min: number; max: number; currency: string } | null; userRating?: number }>;
       priceRange: { min: number; max: number; currency: string };
       hasLiveData: boolean;
     };
     food: {
-      restaurants: Array<{ name: string; address?: string; priceLevel?: number; userRating?: number }>;
+      restaurants: Array<{ name: string; address?: string; cuisine?: string; priceLevel?: number; userRating?: number }>;
       dailyCostPerPerson: { min: number; max: number; currency: string };
       hasLiveData: boolean;
     };
@@ -123,41 +130,7 @@ type TripPlan = {
   };
 };
 
-// ─── Geolocation types ───────────────────────────────────────────────────────
-
-type GeoStatus =
-  | 'idle'                 // not yet attempted
-  | 'detecting'            // waiting for browser permission / GPS fix / reverse geocode
-  | 'detected'             // success — coordinates and name are set
-  | 'denied'               // PERMISSION_DENIED (1)
-  | 'position_unavailable' // POSITION_UNAVAILABLE (2)
-  | 'timeout'              // TIMEOUT (3)
-  | 'unavailable'          // browser unsupported or unexpected failure
-  | 'manual';              // user manually typed/changed the location
-
-type OriginLocation = {
-  name: string;
-  latitude?: number;
-  longitude?: number;
-  /** 'browser-geolocation' when from browser GPS, 'manual' when typed by the user */
-  source: 'browser-geolocation' | 'manual';
-};
-
-/** Calls /api/places/reverse-geocode (server-side Nominatim) */
-async function reverseGeocode(
-  lat: number,
-  lng: number,
-): Promise<{ name: string; city?: string; state?: string; country?: string } | null> {
-  try {
-    const res = await fetch(
-      `/api/places/reverse-geocode?lat=${lat}&lng=${lng}`,
-    );
-    if (!res.ok) return null;
-    return (await res.json()) as { name: string; city?: string; state?: string; country?: string };
-  } catch {
-    return null;
-  }
-}
+// GeoStatus and OriginLocation are imported from StartingLocationInput component.
 
 // ─── Planner page ─────────────────────────────────────────────────────────────
 
@@ -180,150 +153,19 @@ function PlannerPageContent() {
     typeof parsedPrompt.destination === 'string' ? parsedPrompt.destination : '',
   );
 
-  // ── Starting location with geolocation ──────────────────────────────────
-  // If the prompt already has an origin, use it and skip geolocation.
-  const promptHasOrigin = typeof parsedPrompt.origin === 'string' && parsedPrompt.origin.trim() !== '';
+  // ── Starting location ────────────────────────────────────────────────────
+  // If the prompt already has an origin, seed it as a manual entry.
+  const promptOriginName =
+    typeof parsedPrompt.origin === 'string' ? (parsedPrompt.origin as string).trim() : '';
 
   const [origin, setOrigin] = useState<OriginLocation>({
-    name: promptHasOrigin ? (parsedPrompt.origin as string).trim() : '',
-    source: promptHasOrigin ? 'manual' : 'browser-geolocation',
+    name: promptOriginName,
+    source: 'manual',
   });
-  const [geoStatus, setGeoStatus] = useState<GeoStatus>(
-    promptHasOrigin ? 'manual' : 'idle',
-  );
-  // Prevent running geolocation more than once automatically
-  const geoAttempted = useRef(false);
 
-  const detectLocation = useCallback(async () => {
-    if (typeof window === 'undefined' || !navigator?.geolocation) {
-      if (process.env.NODE_ENV === 'development') {
-        console.warn('[Geolocation] navigator.geolocation is not supported in this environment.');
-      }
-      setGeoStatus('unavailable');
-      return;
-    }
-
-    setGeoStatus('detecting');
-
-    navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        try {
-          const { latitude, longitude } = pos.coords;
-          const result = await reverseGeocode(latitude, longitude);
-          if (result && result.name) {
-            setOrigin({
-              name: result.name,
-              latitude,
-              longitude,
-              source: 'browser-geolocation',
-            });
-            setGeoStatus('detected');
-          } else {
-            if (process.env.NODE_ENV === 'development') {
-              console.warn(
-                '[Geolocation] Reverse geocoding returned no address for coords:',
-                latitude,
-                longitude,
-              );
-            }
-            setGeoStatus('position_unavailable');
-          }
-        } catch (err) {
-          if (process.env.NODE_ENV === 'development') {
-            console.warn('[Geolocation] Reverse geocode request failed:', err);
-          }
-          setGeoStatus('position_unavailable');
-        }
-      },
-      (err: GeolocationPositionError) => {
-        if (process.env.NODE_ENV === 'development') {
-          console.warn('[Geolocation Error]', {
-            code: err.code,
-            message: err.message,
-          });
-        }
-
-        switch (err.code) {
-          case 1: // err.PERMISSION_DENIED
-            setGeoStatus('denied');
-            break;
-          case 2: // err.POSITION_UNAVAILABLE
-            setGeoStatus('position_unavailable');
-            break;
-          case 3: // err.TIMEOUT
-            setGeoStatus('timeout');
-            break;
-          default:
-            setGeoStatus('unavailable');
-            break;
-        }
-      },
-      {
-        enableHighAccuracy: true,
-        timeout: 15000,
-        maximumAge: 300000,
-      },
-    );
-  }, []);
-
-  // Auto-detect on first render only (not on every re-render)
-  useEffect(() => {
-    if (geoAttempted.current || promptHasOrigin) return;
-    geoAttempted.current = true;
-    void detectLocation();
-  }, [detectLocation, promptHasOrigin]);
-
-  // Convenience: the plain text the form uses
+  // Convenience aliases used in the rest of the page.
   const startingLocation = origin.name;
-  const setStartingLocation = (name: string) => {
-    setOrigin({ name, latitude: undefined, longitude: undefined, source: 'manual' });
-    setGeoStatus('manual');
-  };
-
-  // Geo status label shown below the input
-  const geoLabel: { icon: string; text: string; color: string } | null = useMemo(() => {
-    switch (geoStatus) {
-      case 'detecting':
-        return {
-          icon: '⏳',
-          text: 'Detecting your current location...',
-          color: '#2563eb',
-        };
-      case 'detected':
-        return {
-          icon: '✓',
-          text: 'Current location detected',
-          color: '#16a34a',
-        };
-      case 'denied':
-        return {
-          icon: '⚠️',
-          text: 'Location permission was denied. Please allow location access for localhost and try again.',
-          color: '#dc2626',
-        };
-      case 'position_unavailable':
-        return {
-          icon: '⚠️',
-          text: 'Your current location could not be determined. Please try again.',
-          color: '#f59e0b',
-        };
-      case 'timeout':
-        return {
-          icon: '⚠️',
-          text: 'Location detection timed out. Please try again.',
-          color: '#f59e0b',
-        };
-      case 'unavailable':
-        return {
-          icon: '⚠️',
-          text: 'Unable to detect location. Please enter your starting location manually.',
-          color: '#f59e0b',
-        };
-      default:
-        return null;
-    }
-  }, [geoStatus]);
-  // ── End geolocation ──────────────────────────────────────────────────────
+  // ── End starting location ─────────────────────────────────────────────────
   const [selectedPlace, setSelectedPlace] = useState<PlaceDetails | null>(null);
   const [budget, setBudget] = useState(
     typeof parsedPrompt.budget === 'number'
@@ -530,67 +372,12 @@ function PlannerPageContent() {
 
             <form onSubmit={handleSubmit}>
 
-              {/* Starting location with geolocation */}
-              <div className="form-group">
-                <label className="form-label" htmlFor="startingLocation">
-                  Starting location
-                </label>
-                <div style={{ position: 'relative' }}>
-                  <input
-                    id="startingLocation"
-                    type="text"
-                    className="form-input"
-                    placeholder={
-                      geoStatus === 'detecting'
-                        ? 'Detecting current location...'
-                        : 'Enter your city or town'
-                    }
-                    value={startingLocation}
-                    onChange={(e) => setStartingLocation(e.target.value)}
-                    aria-describedby="origin-status"
-                    disabled={geoStatus === 'detecting'}
-                  />
-                </div>
-
-                {/* Status line */}
-                {geoLabel && (
-                  <span
-                    id="origin-status"
-                    className="input-help"
-                    style={{ color: geoLabel.color, display: 'flex', alignItems: 'center', gap: '0.35rem' }}
-                  >
-                    <span aria-hidden>{geoLabel.icon}</span>
-                    {geoLabel.text}
-                  </span>
-                )}
-                {!geoLabel && (
-                  <span className="input-help">Where will your journey start?</span>
-                )}
-
-                {/* "Use my current location" button */}
-                <button
-                  type="button"
-                  id="use-current-location-btn"
-                  onClick={() => void detectLocation()}
-                  disabled={geoStatus === 'detecting'}
-                  style={{
-                    marginTop: '0.5rem',
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: '0.35rem',
-                    fontSize: '0.85rem',
-                    fontWeight: 600,
-                    color: geoStatus === 'detecting' ? '#94a3b8' : '#2563eb',
-                    background: 'none',
-                    border: 'none',
-                    padding: 0,
-                    cursor: geoStatus === 'detecting' ? 'not-allowed' : 'pointer',
-                  }}
-                >
-                  <span aria-hidden>📍</span>
-                  {geoStatus === 'detecting' ? 'Detecting current location...' : 'Use my current location'}
-                </button>
-              </div>
+              {/* Starting location — manual entry + optional browser geolocation */}
+              <StartingLocationInput
+                value={origin}
+                onChange={setOrigin}
+                initialGeoStatus={promptOriginName ? 'manual' : 'idle'}
+              />
 
               {/* Destination */}
               <div className="form-group">
@@ -774,10 +561,10 @@ function PlannerPageContent() {
                     <strong>Starting point</strong>
                     {startingLocation || (
                       <em style={{ color: '#94a3b8', fontStyle: 'normal' }}>
-                        {geoStatus === 'detecting' ? 'Detecting…' : 'Not specified'}
+                        Not specified
                       </em>
                     )}
-                    {origin.latitude && geoStatus === 'detected' && (
+                    {origin.latitude && origin.source === 'browser-geolocation' && (
                       <em style={{ display: 'block', fontSize: '0.75rem', color: '#16a34a' }}>
                         📍 GPS detected
                       </em>
@@ -1079,18 +866,28 @@ function PlannerPageContent() {
                       {h.userRating && <div style={{ fontSize: '0.8rem', color: '#f59e0b' }}>★ {h.userRating}</div>}
                     </div>
                     <div style={{ textAlign: 'right', fontSize: '0.85rem' }}>
-                      <span style={{ color: '#64748b' }}>~{fmt(h.pricePerNight.min)}–{fmt(h.pricePerNight.max)}/night</span>
-                      <div style={{ fontSize: '0.7rem', color: '#94a3b8' }}>indicative</div>
+                      {h.pricePerNight && h.pricePerNight.max > 0 ? (
+                        <>
+                          <span style={{ color: '#64748b' }}>~{fmt(h.pricePerNight.min)}–{fmt(h.pricePerNight.max)}/night</span>
+                          <div style={{ fontSize: '0.7rem', color: '#94a3b8' }}>indicative</div>
+                        </>
+                      ) : (
+                        <div style={{ fontSize: '0.75rem', color: '#94a3b8' }}>Booking price unavailable</div>
+                      )}
                     </div>
                   </div>
                 ))}
-                {tripPlan.research!.accommodation.priceRange.max > 0 && (
+                {tripPlan.research!.accommodation.priceRange.max > 0 ? (
                   <div style={{ marginTop: '0.75rem', padding: '0.75rem', background: '#f8fafc', borderRadius: '0.5rem' }}>
                     <strong>Range: </strong>
                     {fmt(tripPlan.research!.accommodation.priceRange.min)} – {fmt(tripPlan.research!.accommodation.priceRange.max)} per night
                     <span style={{ fontSize: '0.75rem', color: '#64748b', marginLeft: '0.5rem' }}>
-                      (from Google price_level indicator — not a booking price)
+                      (from provider data)
                     </span>
+                  </div>
+                ) : (
+                  <div style={{ marginTop: '0.75rem', padding: '0.75rem', background: '#f8fafc', borderRadius: '0.5rem', fontSize: '0.8rem', color: '#64748b' }}>
+                    Live booking prices are unavailable from OpenStreetMap. An estimated accommodation allowance is calculated in the budget breakdown.
                   </div>
                 )}
               </div>
@@ -1101,27 +898,31 @@ function PlannerPageContent() {
               <div className="result-section">
                 <div className="result-section-heading">
                   <h3>🍽️ Food & Restaurants</h3>
-                  <p>Restaurants near {tripPlan.destination} from Google Places.</p>
+                  <p>Restaurants near {tripPlan.destination} from OpenStreetMap.</p>
                 </div>
                 {tripPlan.research.food.restaurants.slice(0, 6).map((r, i) => (
                   <div key={i} style={{ padding: '0.6rem 0', borderBottom: '1px solid #f1f5f9', display: 'flex', justifyContent: 'space-between' }}>
                     <div>
                       <strong style={{ fontSize: '0.9rem' }}>{r.name}</strong>
                       {r.address && <div style={{ fontSize: '0.8rem', color: '#64748b' }}>{r.address}</div>}
+                      {r.cuisine && <div style={{ fontSize: '0.8rem', color: '#64748b' }}>{r.cuisine}</div>}
                       {r.userRating && <div style={{ fontSize: '0.8rem', color: '#f59e0b' }}>★ {r.userRating}</div>}
                     </div>
                     <div style={{ textAlign: 'right', fontSize: '0.85rem', color: '#64748b' }}>
-                      {'₹'.repeat(r.priceLevel ?? 2)}
+                      {r.priceLevel ? '₹'.repeat(r.priceLevel) : <span style={{ fontSize: '0.75rem', color: '#94a3b8' }}>Menu price unavailable</span>}
                     </div>
                   </div>
                 ))}
-                <div style={{ marginTop: '0.75rem', padding: '0.75rem', background: '#f8fafc', borderRadius: '0.5rem' }}>
-                  <strong>Est. daily food cost per person: </strong>
-                  {fmt(tripPlan.research.food.dailyCostPerPerson.min)} – {fmt(tripPlan.research.food.dailyCostPerPerson.max)}
-                  <span style={{ fontSize: '0.75rem', color: '#64748b', marginLeft: '0.5rem' }}>
-                    (3 meals/day from price_level indicator)
-                  </span>
-                </div>
+                {tripPlan.research.food.dailyCostPerPerson.max > 0 ? (
+                  <div style={{ marginTop: '0.75rem', padding: '0.75rem', background: '#f8fafc', borderRadius: '0.5rem' }}>
+                    <strong>Est. daily food cost per person: </strong>
+                    {fmt(tripPlan.research.food.dailyCostPerPerson.min)} – {fmt(tripPlan.research.food.dailyCostPerPerson.max)}
+                  </div>
+                ) : (
+                  <div style={{ marginTop: '0.75rem', padding: '0.75rem', background: '#f8fafc', borderRadius: '0.5rem', fontSize: '0.8rem', color: '#64748b' }}>
+                    Restaurant discovery provided by OpenStreetMap. Menu prices are not published; an estimated daily food allowance is included in the budget breakdown.
+                  </div>
+                )}
               </div>
             ) : null}
 
@@ -1130,7 +931,7 @@ function PlannerPageContent() {
               <div className="result-section">
                 <div className="result-section-heading">
                   <h3>🌦️ Weather</h3>
-                  <p>Live weather data from OpenWeatherMap.</p>
+                  <p>Live weather data from Open-Meteo.</p>
                 </div>
                 {tripPlan.research.weather.current && (
                   <div style={{ padding: '0.75rem', background: '#f0f9ff', borderRadius: '0.5rem', marginBottom: '0.75rem' }}>
@@ -1161,7 +962,7 @@ function PlannerPageContent() {
               <div className="result-section">
                 <div className="result-section-heading">
                   <h3>📊 Research-Based Cost Estimate</h3>
-                  <p>Calculated from provider data. Sources shown per line.</p>
+                  <p>Calculated from provider data &amp; distance models. Sources shown per line.</p>
                 </div>
                 <div style={{ background: '#f8fafc', borderRadius: '0.75rem', padding: '1.25rem' }}>
                   {[
@@ -1178,12 +979,25 @@ function PlannerPageContent() {
                         <strong>{fmt(item.lineTotal)}</strong>
                         {'isLiveData' in item && (
                           <span style={{ marginLeft: '0.5rem', fontSize: '0.7rem', color: item.isLiveData ? '#16a34a' : '#94a3b8' }}>
-                            {item.isLiveData ? '● live' : '○ est.'}
+                            {item.isLiveData ? '● live quote' : '○ estimate'}
                           </span>
                         )}
                       </div>
                     </div>
                   ))}
+
+                  {/* Known vs Estimated Provenance Breakdown */}
+                  <div style={{ marginTop: '0.75rem', padding: '0.6rem 0.75rem', background: '#f1f5f9', borderRadius: '0.5rem', fontSize: '0.8rem', display: 'flex', justifyContent: 'space-between' }}>
+                    <span><strong>Known Provider Cost:</strong> {fmt(tripPlan.researchBudget.knownCost ?? 0)}</span>
+                    <span><strong>Estimated Cost:</strong> {fmt(tripPlan.researchBudget.estimatedCost ?? tripPlan.researchBudget.total)}</span>
+                  </div>
+
+                  {Boolean(tripPlan.researchBudget.unavailableCosts && tripPlan.researchBudget.unavailableCosts.length > 0) && (
+                    <div style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: '#64748b' }}>
+                      <em>Unavailable live quotes:</em> {tripPlan.researchBudget.unavailableCosts!.join(' · ')}
+                    </div>
+                  )}
+
                   <div style={{ marginTop: '1rem', display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '0.5rem', textAlign: 'center' }}>
                     <div style={{ background: '#ecfdf5', borderRadius: '0.5rem', padding: '0.75rem' }}>
                       <div style={{ fontSize: '0.75rem', color: '#64748b' }}>Minimum</div>

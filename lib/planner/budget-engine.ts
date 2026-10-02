@@ -107,12 +107,17 @@ export function calculateBudget(
 /**
  * Builds a ResearchBudget from live/estimated provider data.
  *
+ * Distinguishes:
+ *   - Known costs (backed by live provider quotes)
+ *   - Estimated costs (heuristics / distance-based / tier rates)
+ *   - Unavailable costs (line items where live prices could not be obtained)
+ *
  * Formula:
  *   accommodation  = priceRange.mid × rooms × nights
  *   food           = dailyCostPerPerson.mid × travelers × days
  *   intercity      = selected transport option midpoint × travelers
  *   localTransport = dailyEstimatePerPerson.mid × travelers × days
- *   activities     = config-based per-person per-day (no live data yet)
+ *   activities     = config-based per-person per-day
  *   buffer         = subtotal × BUDGET_BUFFER_RATE
  *   total          = subtotal + buffer
  */
@@ -122,15 +127,26 @@ export function calculateResearchBudget(
 ): ResearchBudget {
   const currency = research.request.currency ?? DEFAULT_CURRENCY;
   const now = new Date().toISOString();
+  const unavailableCosts: string[] = [];
+
   const configSource = {
-    name: `Config estimate (BUDGET_BASE_* env vars) — not a live price`,
+    name: `Heuristic estimate (BUDGET_BASE_* config) — not a live provider price`,
     sourceType: 'estimated' as const,
+    confidence: 'low' as const,
     retrievedAt: now,
   };
 
   // ── Accommodation ──────────────────────────────────────────────────────────
   const accRange = research.accommodation.priceRange;
-  const accHasData = research.accommodation.hasLiveData && accRange.max > 0;
+  const accHasData =
+    research.accommodation.hasLiveData &&
+    accRange.max > 0 &&
+    research.accommodation.availability !== 'price_unavailable';
+
+  if (!accHasData) {
+    unavailableCosts.push('Hotel booking pricing (live booking rates unavailable from free data provider)');
+  }
+
   const accMid = accHasData
     ? Math.round((accRange.min + accRange.max) / 2)
     : Math.round(
@@ -145,7 +161,7 @@ export function calculateResearchBudget(
     name: `${request.travelStyle} accommodation`,
     description: accHasData
       ? `${research.accommodation.tier} hotels near ${request.destination}`
-      : `Config-based estimate — no live hotel data`,
+      : `Estimated accommodation (${research.accommodation.tier} tier) — live booking price unavailable from free data provider`,
     priceRange: accHasData
       ? { min: accRange.min * request.days, max: accRange.max * request.days, currency }
       : { min: accTotal, max: accTotal, currency },
@@ -160,6 +176,11 @@ export function calculateResearchBudget(
   // ── Food ───────────────────────────────────────────────────────────────────
   const foodRange = research.food.dailyCostPerPerson;
   const foodHasData = research.food.hasLiveData && foodRange.max > 0;
+
+  if (!foodHasData) {
+    unavailableCosts.push('Restaurant menu pricing (exact dish prices unavailable from free data provider)');
+  }
+
   const foodMidPerPersonPerDay = foodHasData
     ? Math.round((foodRange.min + foodRange.max) / 2)
     : Math.round(BUDGET_BASE_FOOD * BUDGET_STYLE_MULTIPLIERS[request.travelStyle]);
@@ -170,7 +191,7 @@ export function calculateResearchBudget(
     name: `${request.travelStyle} food`,
     description: foodHasData
       ? `Restaurant data near ${request.destination}`
-      : `Config-based estimate — no live restaurant data`,
+      : `Estimated food cost (${research.food.tier} tier) — menu prices unavailable from free data provider`,
     priceRange: {
       min: foodHasData
         ? foodRange.min * request.travelers * request.days
@@ -210,8 +231,8 @@ export function calculateResearchBudget(
       ? `${selectedTransport.mode} — ${request.origin} → ${request.destination}`
       : `Transport estimate`,
     description: transHasData
-      ? `${selectedTransport.source.name}`
-      : `Config-based estimate — no live transport data`,
+      ? `${selectedTransport.source.name} (distance estimate, not a live ticket price)`
+      : `Estimated transport — no live booking provider configured`,
     priceRange: transHasData
       ? {
           min: selectedTransport.priceRange.min * request.travelers,
@@ -224,7 +245,7 @@ export function calculateResearchBudget(
     quantity: request.travelers,
     lineTotal: transTotal,
     source: transHasData ? selectedTransport.source : configSource,
-    isLiveData: false, // transport is always estimated (no live booking)
+    isLiveData: false, // transport is always estimated (no live ticket API)
   };
 
   // ── Local transport ────────────────────────────────────────────────────────
@@ -260,7 +281,7 @@ export function calculateResearchBudget(
     id: 'activities',
     category: 'activity',
     name: 'Activities & entry fees',
-    description: `Config-based estimate — real entry fees shown in places section`,
+    description: `Estimated activities allowance — individual attraction fees vary`,
     priceRange: { min: actTotal, max: actTotal, currency },
     selectedAmount: actMid,
     unit: 'per_person',
@@ -283,7 +304,7 @@ export function calculateResearchBudget(
     unit: 'flat',
     quantity: 1,
     lineTotal: bufferAmount,
-    source: { name: 'Deterministic calculation', sourceType: 'estimated', retrievedAt: now },
+    source: { name: 'Deterministic calculation', sourceType: 'estimated', confidence: 'high', retrievedAt: now },
     isLiveData: false,
   };
 
@@ -307,6 +328,15 @@ export function calculateResearchBudget(
   const minimum = minItems.reduce((s, v) => s + v, 0) + bufferAmount;
   const maximum = maxItems.reduce((s, v) => s + v, 0) + bufferAmount;
 
+  // ── Known vs Estimated Costs ───────────────────────────────────────────────
+  const allCostItems = [accItem, foodItem, transItem, localItem, actItem];
+  const knownCost = allCostItems
+    .filter((item) => item.isLiveData)
+    .reduce((sum, item) => sum + item.lineTotal, 0);
+  const estimatedCost = allCostItems
+    .filter((item) => !item.isLiveData)
+    .reduce((sum, item) => sum + item.lineTotal, 0) + bufferAmount;
+
   return {
     accommodation: accItem,
     food: foodItem,
@@ -326,14 +356,17 @@ export function calculateResearchBudget(
     minimum,
     maximum,
     remaining: request.budget - total,
+    knownCost,
+    estimatedCost,
+    unavailableCosts,
     breakdown:
       `Accommodation: ${currency} ${accTotal.toLocaleString()} ` +
-      `(${request.days} night${request.days > 1 ? 's' : ''} × ${currency} ${accMid.toLocaleString()}) | ` +
+      `(${request.days} night${request.days > 1 ? 's' : ''} × ${currency} ${accMid.toLocaleString()}${accHasData ? ' - provider' : ' - estimate'}) | ` +
       `Food: ${currency} ${foodTotal.toLocaleString()} ` +
-      `(${request.travelers} traveler${request.travelers > 1 ? 's' : ''} × ${request.days} days × ${currency} ${foodMidPerPersonPerDay.toLocaleString()}/person/day) | ` +
-      `Transport: ${currency} ${transTotal.toLocaleString()} | ` +
-      `Local transport: ${currency} ${localTotal.toLocaleString()} | ` +
-      `Activities: ${currency} ${actTotal.toLocaleString()} | ` +
+      `(${request.travelers} traveler${request.travelers > 1 ? 's' : ''} × ${request.days} days × ${currency} ${foodMidPerPersonPerDay.toLocaleString()}/person/day${foodHasData ? ' - provider' : ' - estimate'}) | ` +
+      `Transport: ${currency} ${transTotal.toLocaleString()} (distance estimate) | ` +
+      `Local transport: ${currency} ${localTotal.toLocaleString()} (estimate) | ` +
+      `Activities: ${currency} ${actTotal.toLocaleString()} (estimate) | ` +
       `Buffer (${Math.round(BUDGET_BUFFER_RATE * 100)}%): ${currency} ${bufferAmount.toLocaleString()}`,
   };
 }

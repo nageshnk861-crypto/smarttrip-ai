@@ -12,7 +12,9 @@
 export type SourceType =
   | 'live'        // real-time API response
   | 'provider'    // provider data (may be slightly cached by the provider)
-  | 'estimated'   // calculated from distance/route data, not a live quote
+  | 'database'    // verified internal database
+  | 'estimate'    // calculated from distance/route data, not a live quote
+  | 'estimated'   // backward-compatible alias for 'estimate'
   | 'cached'      // our own short-lived cache of a previous live result
   | 'unavailable' // provider returned no data or is not configured
   | 'user';       // supplied directly by the user
@@ -21,6 +23,8 @@ export type DataSource = {
   /** Human-readable provider name, e.g. "Google Places", "OpenStreetMap". */
   name: string;
   sourceType: SourceType;
+  /** Level of confidence in this price or data item. */
+  confidence?: 'high' | 'medium' | 'low';
   /** ISO 8601 timestamp when this data was fetched. */
   retrievedAt: string;
   /** ISO 8601 timestamp after which the data should be considered stale. */
@@ -38,10 +42,14 @@ export type PriceRange = {
   currency: string;
 };
 
-/** A single price (exact or central estimate). */
+/** A single price (exact or central estimate) with full provenance. */
 export type Price = {
   amount: number;
   currency: string;
+  source?: string;
+  sourceType?: SourceType;
+  confidence?: 'high' | 'medium' | 'low';
+  retrievedAt?: string;
 };
 
 export type PriceUnit =
@@ -96,7 +104,12 @@ export type HotelResult = {
   starRating?: number;
   userRating?: number;
   ratingCount?: number;
-  pricePerNight: PriceRange;
+  /** Null when provider cannot provide booking rates (e.g. free OSM). */
+  pricePerNight?: PriceRange | null;
+  /** Exact or central price with provenance if known, null if unavailable. */
+  price?: Price | null;
+  /** Explicit indicator of whether live booking rates were found. */
+  availability?: 'available' | 'price_unavailable' | 'unavailable';
   roomType?: string;
   amenities?: string[];
   source: DataSource;
@@ -109,6 +122,7 @@ export type AccommodationResearch = {
   results: HotelResult[];
   /** Aggregated price range across all results (for this tier). */
   priceRange: PriceRange;
+  availability?: 'available' | 'price_unavailable' | 'unavailable';
   nights: number;
   tier: 'budget' | 'standard' | 'premium';
   source: DataSource;
@@ -126,8 +140,9 @@ export type RestaurantResult = {
   priceLevel?: 1 | 2 | 3 | 4;   // Google price_level scale
   userRating?: number;
   ratingCount?: number;
-  /** Estimated meal cost per person from provider data. */
-  mealCostPerPerson?: PriceRange;
+  /** Estimated meal cost per person from provider data (null if unavailable). */
+  mealCostPerPerson?: PriceRange | null;
+  price?: Price | null;
   source: DataSource;
 };
 
@@ -214,7 +229,8 @@ export type TouristPlace = {
   address?: string;
   description?: string;
   openingHours?: string;
-  entryFee?: PriceRange;
+  entryFee?: PriceRange | null;
+  entryFeeSource?: 'provider' | 'database' | 'estimate' | 'unknown';
   /** true if fee data came from a provider, false if unknown/unavailable. */
   hasFeeData: boolean;
   userRating?: number;
@@ -324,4 +340,10 @@ export type ResearchBudget = {
   /** How the total was calculated — shown to the user. */
   breakdown: string;
   remaining: number;
+  /** Sum of line items backed by confirmed live provider prices. */
+  knownCost: number;
+  /** Sum of line items derived from distance/heuristics/config estimates. */
+  estimatedCost: number;
+  /** List of cost components where live booking rates could not be obtained. */
+  unavailableCosts: string[];
 };
